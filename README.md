@@ -37,13 +37,38 @@ needed HDR and a handful of scene-level effects upstream doesn't have yet.
 
 ## Building
 
+Dependencies: wlroots 0.20, wayland, libdrm, xkbcommon, pixman.
+
 ```bash
 meson setup build --prefix=/usr
 ninja -C build
 sudo ninja -C build install
 ```
 
-asteroidz links against this as `scenefx-0.5`.
+asteroidz links against this as `scenefx-0.5`. Install with
+`--prefix=/usr` so it lands beside the system `wlroots0.20`; the stock
+`scenefx` packages are 0.3/0.4 and won't satisfy asteroidz's
+`scenefx-0.5` dependency.
+
+### Arch Linux
+
+`wlroots0.20` is in the official `extra` repo; everything else is in the
+base repos. There's no separate scenefx package to conflict with — this
+fork installs its own `scenefx-0.5` pkg-config file.
+
+```bash
+sudo pacman -S --needed base-devel git meson ninja \
+  wlroots0.20 wayland wayland-protocols libdrm libxkbcommon pixman
+
+git clone https://github.com/ralfwierzbicki/asteroidz-scenefx.git
+cd asteroidz-scenefx
+meson setup build --prefix=/usr
+ninja -C build
+sudo ninja -C build install
+```
+
+Then build [asteroidz](https://github.com/ralfwierzbicki/asteroidz)
+itself — see its README for the compositor build.
 
 ## Credits
 
