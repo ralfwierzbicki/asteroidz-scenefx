@@ -57,8 +57,19 @@ present: `VK_EXT_image_drm_format_modifier`, `VK_EXT_physical_device_drm`,
        `-Drenderers=gles2` is unaffected (vulkan block fully guarded);
     3. **done** — `fx_vk_renderer_create_with_drm_fd()` returns the real
        renderer (`fx_vulkan_renderer_create_for_device`), exported from the .so;
-    4. **next** — implement scenefx's `fx_render_pass` on the Vulkan pass
-       (effects as no-ops first) so scenefx's scene works on Vulkan.
+    4. **done** — scenefx's scene (`types/scene/wlr_scene.c`) is now
+       renderer-agnostic. A dispatch layer (`fx_render_pass_try_get()` + the
+       `scene_pass_add_*` helpers) routes base surfaces/rects to the plain
+       `wlr_render_pass` and treats effects (shadow, blur, rounded corners,
+       gradients) as no-ops when the pass is not the GLES fx pass; the GLES path
+       is byte-identical. Verified: scenefx's `tinywl` on
+       `WLR_RENDERER=vulkan WLR_BACKENDS=headless` brings up the Vulkan renderer
+       on the RX 7900 XT and creates the output render buffer with no
+       errors/asserts. End-to-end compositing is validated by the asteroidz flip
+       (below).
+- **Effects — no-ops for now.** Shadow/blur/rounded corners/gradients render as
+  nothing (or degrade to a plain rect) on Vulkan until the SPIR-V effect
+  pipelines land.
 - **Effect pipelines — TODO.** rounded corners → box shadow → blur → gradients
   → color LUT, each a SPIR-V port of the GLES shader.
 

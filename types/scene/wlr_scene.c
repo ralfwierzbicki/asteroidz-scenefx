@@ -19,6 +19,7 @@
 
 #include "render/color.h"
 #include "render/fx_renderer/fx_renderer.h"
+#include "render/pass.h"
 #include "render/tracy.h"
 #include "scenefx/render/fx_renderer/fx_offscreen_buffers.h"
 #include "scenefx/render/pass.h"
@@ -2051,9 +2052,85 @@ void wlr_scene_set_sdr_reference_luminance(struct wlr_scene *scene, float lumina
 	}
 }
 
+// scenefx's effect primitives are implemented only by the GLES renderer. When
+// another renderer is in use (e.g. Vulkan), fall back to the base
+// wlr_render_pass for surfaces/rects and treat effects (shadow, blur, rounded
+// corners, gradients) as no-ops so the plain scene still renders.
+
+static void scene_pass_add_texture(struct wlr_render_pass *pass,
+		const struct fx_render_texture_options *options) {
+	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
+	if (fx != NULL) {
+		fx_render_pass_add_texture(fx, options);
+	} else {
+		wlr_render_pass_add_texture(pass, &options->base);
+	}
+}
+
+static void scene_pass_add_rect(struct wlr_render_pass *pass,
+		const struct fx_render_rect_options *options) {
+	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
+	if (fx != NULL) {
+		fx_render_pass_add_rect(fx, options);
+	} else {
+		wlr_render_pass_add_rect(pass, &options->base);
+	}
+}
+
+static void scene_pass_add_rounded_rect(struct wlr_render_pass *pass,
+		const struct fx_render_rounded_rect_options *options) {
+	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
+	if (fx != NULL) {
+		fx_render_pass_add_rounded_rect(fx, options);
+	} else {
+		wlr_render_pass_add_rect(pass, &options->base);
+	}
+}
+
+static void scene_pass_add_rounded_rect_grad(struct wlr_render_pass *pass,
+		const struct fx_render_rounded_rect_grad_options *options) {
+	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
+	if (fx != NULL) {
+		fx_render_pass_add_rounded_rect_grad(fx, options);
+	} else {
+		wlr_render_pass_add_rect(pass, &options->base);
+	}
+}
+
+static void scene_pass_add_box_shadow(struct wlr_render_pass *pass,
+		const struct fx_render_box_shadow_options *options) {
+	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
+	if (fx != NULL) {
+		fx_render_pass_add_box_shadow(fx, options);
+	}
+	// no shadow on non-GLES renderers
+}
+
+static void scene_pass_add_blur(struct wlr_render_pass *pass,
+		struct fx_render_blur_pass_options *options) {
+	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
+	if (fx != NULL) {
+		fx_render_pass_add_blur(fx, options);
+	}
+	// no blur on non-GLES renderers
+}
+
+static bool scene_pass_add_optimized_blur(struct wlr_render_pass *pass,
+		struct fx_render_blur_pass_options *options) {
+	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
+	if (fx != NULL) {
+		return fx_render_pass_add_optimized_blur(fx, options);
+	}
+	return false;
+}
+
+static bool scene_pass_has_blur(struct wlr_render_pass *pass) {
+	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
+	return fx != NULL && fx->has_blur;
+}
+
 static void scene_entry_render(struct render_list_entry *entry, const struct render_data *data) {
 	struct wlr_scene_node *node = entry->node;
-	struct fx_gles_render_pass *fx_pass = fx_get_render_pass(data->render_pass);
 
 	pixman_region32_t render_region;
 	pixman_region32_init(&render_region);
@@ -2142,16 +2219,16 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 				.corners = fx_corner_radii_scale(rect_corners, data->scale),
 				.clipped_region = rect_options.clipped_region,
 			};
-			fx_render_pass_add_rounded_rect_grad(fx_pass, &grad_options);
+			scene_pass_add_rounded_rect_grad(data->render_pass, &grad_options);
 		} else if (!fx_corner_radii_is_empty(&rect_corners)) {
 			struct fx_render_rounded_rect_options rounded_rect_options = {
 				.base = rect_options.base,
 				.corners = fx_corner_radii_scale(rect_corners, data->scale),
 				.clipped_region = rect_options.clipped_region,
 			};
-			fx_render_pass_add_rounded_rect(fx_pass, &rounded_rect_options);
+			scene_pass_add_rounded_rect(data->render_pass, &rounded_rect_options);
 		} else {
-			fx_render_pass_add_rect(fx_pass, &rect_options);
+			scene_pass_add_rect(data->render_pass, &rect_options);
 		}
 		break;
 	case WLR_SCENE_NODE_BUFFER:;
@@ -2226,7 +2303,7 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 		};
 
 		// TODO: Use the base wlr_render_pass_add_texture as a fast-path in the future
-		fx_render_pass_add_texture(fx_pass, &tex_options);
+		scene_pass_add_texture(data->render_pass, &tex_options);
 
 		struct wlr_scene_output_sample_event sample_event = {
 			.output = data->output,
@@ -2276,13 +2353,13 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 			},
 			.clip = &render_region,
 		};
-		fx_render_pass_add_box_shadow(fx_pass, &shadow_options);
+		scene_pass_add_box_shadow(data->render_pass, &shadow_options);
 		break;
 	case WLR_SCENE_NODE_OPTIMIZED_BLUR:;
 		struct wlr_scene_optimized_blur *scene_blur = wlr_scene_optimized_blur_from_node(node);
 		// Re-render the optimized blur buffer when needed. Retry rendering
 		// until there's a visible blur_node.
-		if (fx_pass->has_blur && is_scene_blur_enabled(&scene->blur_data)
+		if (scene_pass_has_blur(data->render_pass) && is_scene_blur_enabled(&scene->blur_data)
 				&& scene_blur->dirty) {
 			const float opacity = 1.0f;
 			enum wl_output_transform transform =
@@ -2303,7 +2380,7 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 				.blur_data = &scene->blur_data,
 				.blur_strength = 1.0f,
 			};
-			bool result = fx_render_pass_add_optimized_blur(fx_pass, &blur_options);
+			bool result = scene_pass_add_optimized_blur(data->render_pass, &blur_options);
 			if (result) {
 				scene_blur->dirty = false;
 			}
@@ -2382,7 +2459,7 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 			.ignore_transparent = mask != NULL,
 			.blur_strength = blur->strength,
 		};
-		fx_render_pass_add_blur(fx_pass, &blur_options);
+		scene_pass_add_blur(data->render_pass, &blur_options);
 		break;
 	}
 
@@ -3563,10 +3640,14 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 	wlr_damage_ring_rotate_buffer(&scene_output->damage_ring, buffer,
 		&render_data.damage);
 
-	struct fx_gles_render_pass *fx_pass = fx_get_render_pass(render_pass);
-	fx_render_pass_set_color_resolve_damage(render_pass, &render_data.damage);
+	// NULL when the active renderer is not scenefx's GLES renderer (e.g.
+	// Vulkan): the GLES-only effect/offscreen machinery below is then skipped.
+	struct fx_gles_render_pass *fx_pass = fx_render_pass_try_get(render_pass);
+	if (fx_pass != NULL) {
+		fx_render_pass_set_color_resolve_damage(render_pass, &render_data.damage);
+	}
 	bool should_compensate_blur = false;
-	if (fx_render_pass_init_offscreen_buffers(render_pass, output)
+	if (fx_pass != NULL && fx_render_pass_init_offscreen_buffers(render_pass, output)
 			&& pixman_region32_not_empty(&render_data.damage)) {
 		// Blur artifact prevention
 		// Note: Supports individual blur node blur_data
@@ -3734,7 +3815,7 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 				fx_pass->buffer, fx_pass->fx_offscreen_buffers->blur_saved_pixels_buffer);
 	}
 
-	if (zoom_active && fx_pass->fx_offscreen_buffers != NULL) {
+	if (zoom_active && fx_pass != NULL && fx_pass->fx_offscreen_buffers != NULL) {
 		scene_output_render_zoom(scene_output, fx_pass, &render_data);
 	}
 

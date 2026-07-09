@@ -148,6 +148,14 @@ struct fx_gles_render_pass *fx_get_render_pass(struct wlr_render_pass *render_pa
 	return pass;
 }
 
+struct fx_gles_render_pass *fx_render_pass_try_get(struct wlr_render_pass *render_pass) {
+	if (render_pass->impl != &render_pass_impl) {
+		return NULL;
+	}
+	struct fx_gles_render_pass *pass = wl_container_of(render_pass, pass, base);
+	return pass;
+}
+
 void fx_render_pass_set_color_resolve_damage(struct wlr_render_pass *render_pass,
 		const pixman_region32_t *damage) {
 	struct fx_gles_render_pass *pass = fx_get_render_pass(render_pass);
