@@ -1396,6 +1396,254 @@ struct fx_vk_effect_image *fx_vk_render_pass_blur(struct fx_vk_render_pass *pass
 	return cur;
 }
 
+// ---- scenefx blur wiring (fx_vk fork) ---------------------------------------
+
+// Per-frame plumbing: attach the persistent per-output effect image set to the
+// pass and note whether (enabled) blur nodes exist. Called from the scene.
+void fx_vk_render_pass_init_blur(struct wlr_render_pass *wlr_pass,
+		struct wlr_output *output, bool has_blur) {
+	struct fx_vk_render_pass *pass = fx_vk_render_pass_try_get(wlr_pass);
+	if (pass == NULL) {
+		return;
+	}
+	pass->effect_buffers = fx_vk_effect_buffers_get(pass->renderer, output,
+		output->width, output->height);
+	pass->has_blur = has_blur && pass->effect_buffers != NULL;
+}
+
+bool fx_vk_render_pass_has_blur(struct wlr_render_pass *wlr_pass) {
+	struct fx_vk_render_pass *pass = fx_vk_render_pass_try_get(wlr_pass);
+	return pass != NULL && pass->has_blur;
+}
+
+// Full-extent image copy between two GENERAL-layout 16F images (transfer).
+// Must be recorded with no render pass active.
+static void copy_effect_image(struct fx_vk_render_pass *pass, VkImage src,
+		VkImage dst, int width, int height) {
+	VkImageCopy region = {
+		.srcSubresource = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.layerCount = 1,
+		},
+		.dstSubresource = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.layerCount = 1,
+		},
+		.extent = { width, height, 1 },
+	};
+	vkCmdCopyImage(pass->command_buffer->vk,
+		src, VK_IMAGE_LAYOUT_GENERAL,
+		dst, VK_IMAGE_LAYOUT_GENERAL,
+		1, &region);
+}
+
+// Draws an effect image (e.g. the cached blur) into the currently-open scene
+// pass at dst_box, sampling src normalized to the same box. Mirrors
+// render_texture()'s projection/uv/pcr layout, but binds the effect image's
+// sampler descriptor (set 0) instead of a wlr_texture view. The effect image's
+// DS was allocated with the BILINEAR tex pipeline layout, so the pipeline
+// selected here (same layout key) is compatible with src->ds.
+static void render_effect_image(struct fx_vk_render_pass *pass,
+		struct fx_vk_effect_image *src, const struct wlr_box *dst_box,
+		const pixman_region32_t *clip, const struct fx_corner_fradii *corners,
+		const struct clipped_fregion *clipped_region,
+		const struct wlr_box *clip_box, float alpha) {
+	VkCommandBuffer cb = pass->command_buffer->vk;
+
+	if (dst_box->width <= 0 || dst_box->height <= 0 ||
+			src->width <= 0 || src->height <= 0) {
+		return;
+	}
+
+	bool use_effects = !fx_corner_fradii_is_empty(corners) ||
+		clipped_fregion_is_valid(clipped_region);
+
+	float proj[9], matrix[9];
+	wlr_matrix_identity(proj);
+	wlr_matrix_project_box(matrix, dst_box, WL_OUTPUT_TRANSFORM_NORMAL, proj);
+	wlr_matrix_multiply(matrix, pass->projection, matrix);
+
+	// The cache holds the full-screen background in scene-image coords, so a
+	// node at box B samples cache[B] and draws at B (src normalized = B/size).
+	struct fx_vk_vert_pcr_data vert_pcr_data = {
+		.uv_off = {
+			(float)dst_box->x / src->width,
+			(float)dst_box->y / src->height,
+		},
+		.uv_size = {
+			(float)dst_box->width / src->width,
+			(float)dst_box->height / src->height,
+		},
+	};
+	encode_proj_matrix(matrix, vert_pcr_data.mat4);
+
+	struct fx_vk_pipeline *pipe = setup_get_or_create_pipeline(
+		pass->render_setup,
+		&(struct fx_vk_pipeline_key) {
+			.source = use_effects ?
+				WLR_VK_SHADER_SOURCE_TEXTURE_ROUND : WLR_VK_SHADER_SOURCE_TEXTURE,
+			.layout = {
+				.filter_mode = WLR_SCALE_FILTER_BILINEAR,
+			},
+			.texture_transform = WLR_VK_TEXTURE_TRANSFORM_IDENTITY,
+			.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+		});
+	if (!pipe) {
+		pass->failed = true;
+		return;
+	}
+
+	float color_matrix[9];
+	wlr_matrix_identity(color_matrix);
+	struct fx_vk_frag_texture_pcr_data frag_pcr_data = {
+		.alpha = alpha,
+		.luminance_multiplier = 1,
+	};
+	encode_color_matrix(color_matrix, frag_pcr_data.matrix);
+
+	bind_pipeline(pass, pipe->vk);
+	vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		pipe->layout->vk, 0, 1, &src->ds, 0, NULL);
+	vkCmdPushConstants(cb, pipe->layout->vk,
+		VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vert_pcr_data), &vert_pcr_data);
+	vkCmdPushConstants(cb, pipe->layout->vk,
+		VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(vert_pcr_data),
+		sizeof(frag_pcr_data), &frag_pcr_data);
+
+	if (use_effects) {
+		struct wlr_box corner_box = *dst_box;
+		if (clip_box != NULL && !wlr_box_empty(clip_box)) {
+			corner_box = *clip_box;
+		}
+		struct fx_vk_frag_corner_pcr_data corner_pcr;
+		fill_corner_pcr(&corner_pcr, &corner_box, corners, clipped_region);
+		vkCmdPushConstants(cb, pipe->layout->vk, VK_SHADER_STAGE_FRAGMENT_BIT,
+			FX_VK_TEX_ROUND_CORNER_OFFSET, sizeof(corner_pcr), &corner_pcr);
+	}
+
+	pixman_region32_t clip_region;
+	get_clip_region(pass, clip, &clip_region);
+
+	int clip_rects_len;
+	const pixman_box32_t *clip_rects =
+		pixman_region32_rectangles(&clip_region, &clip_rects_len);
+	for (int i = 0; i < clip_rects_len; i++) {
+		VkRect2D rect;
+		convert_pixman_box_to_vk_rect(&clip_rects[i], &rect);
+		vkCmdSetScissor(cb, 0, 1, &rect);
+		vkCmdDraw(cb, 4, 1, 0, 0);
+
+		struct wlr_box clip_rect_box = {
+			.x = clip_rects[i].x1,
+			.y = clip_rects[i].y1,
+			.width = clip_rects[i].x2 - clip_rects[i].x1,
+			.height = clip_rects[i].y2 - clip_rects[i].y1,
+		};
+		struct wlr_box intersection;
+		if (wlr_box_intersection(&intersection, dst_box, &clip_rect_box)) {
+			render_pass_mark_box_updated(pass, &intersection);
+		}
+	}
+
+	pixman_region32_fini(&clip_region);
+}
+
+// Computes the cached whole-background (optimized) blur. The scene pass is
+// currently OPEN, so this splits it: end the scene pass, snapshot + blur the
+// scene image via transfers/effect passes, then restart the scene pass (its
+// loadOp is LOAD, so prior content is preserved).
+bool fx_vk_render_pass_add_optimized_blur(struct wlr_render_pass *wlr_pass,
+		struct fx_render_blur_pass_options *options) {
+	struct fx_vk_render_pass *pass = fx_vk_render_pass_try_get(wlr_pass);
+	if (pass == NULL || pass->failed) {
+		return false;
+	}
+	struct fx_vk_effect_buffers *bufs = pass->effect_buffers;
+	if (bufs == NULL || options->blur_data == NULL ||
+			!is_scene_blur_enabled(options->blur_data)) {
+		return false;
+	}
+	// Optimized blur relies on the readable scene image of the two-pass path.
+	if (!pass->two_pass) {
+		return false;
+	}
+
+	struct fx_vk_render_buffer *render_buffer = pass->render_buffer;
+	VkCommandBuffer cb = pass->command_buffer->vk;
+	int width = bufs->width, height = bufs->height;
+	int buf_width = render_buffer->wlr_buffer->width;
+	int buf_height = render_buffer->wlr_buffer->height;
+
+	// Do not mutate the reference blur_data (matches GLES get_main_buffer_blur).
+	struct blur_data blur_data =
+		blur_data_apply_strength(options->blur_data, options->blur_strength);
+
+	// End the scene pass: the scene image (GENERAL) is now fully readable.
+	vkCmdEndRenderPass(cb);
+	pass->bound_pipeline = VK_NULL_HANDLE;
+
+	// Snapshot the unblurred scene into optimized_no_blur. This is both the
+	// blur source (effect images carry the tex-layout sampler DS the blur
+	// pipelines need; the scene image's DS is the output layout, incompatible)
+	// and the saved non-blurred version.
+	copy_effect_image(pass, render_buffer->two_pass.blend_image,
+		bufs->optimized_no_blur->image, width, height);
+
+	// Dual-Kawase blur of the snapshot into the ping-pong effect buffers.
+	struct fx_vk_effect_image *result =
+		fx_vk_render_pass_blur(pass, bufs, bufs->optimized_no_blur, &blur_data);
+
+	// Persist the blurred result in the cache.
+	if (result != NULL && result != bufs->optimized_blur) {
+		copy_effect_image(pass, result->image, bufs->optimized_blur->image,
+			width, height);
+	}
+	bufs->optimized_blur_valid = true;
+
+	// Restart the scene pass so the remaining nodes keep drawing into it.
+	VkRect2D full_rect = { .extent = { buf_width, buf_height } };
+	VkRenderPassBeginInfo rp_info = {
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		.renderArea = full_rect,
+		.clearValueCount = 0,
+		.renderPass = render_buffer->two_pass.render_setup->render_pass,
+		.framebuffer = render_buffer->two_pass.scene_framebuffer,
+	};
+	vkCmdBeginRenderPass(cb, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdSetViewport(cb, 0, 1, &(VkViewport){
+		.width = buf_width,
+		.height = buf_height,
+		.maxDepth = 1,
+	});
+	pass->bound_pipeline = VK_NULL_HANDLE;
+
+	return !pass->failed;
+}
+
+// Per-window/layer blur: draws the cached blurred background into the scene
+// image at the node's box, within the currently-open scene pass.
+void fx_vk_render_pass_add_blur(struct wlr_render_pass *wlr_pass,
+		struct fx_render_blur_pass_options *options) {
+	struct fx_vk_render_pass *pass = fx_vk_render_pass_try_get(wlr_pass);
+	if (pass == NULL || pass->failed) {
+		return;
+	}
+	struct fx_vk_effect_buffers *bufs = pass->effect_buffers;
+	// Bail gracefully if there's no valid cached background blur (optimized
+	// blur never ran / disabled); draw nothing rather than crash.
+	if (bufs == NULL || !bufs->optimized_blur_valid) {
+		return;
+	}
+
+	struct fx_render_texture_options *tex_options = &options->tex_options;
+	struct wlr_box dst_box = tex_options->base.dst_box;
+	float alpha = tex_options->base.alpha != NULL ?
+		*tex_options->base.alpha : 1.0f;
+
+	render_effect_image(pass, bufs->optimized_blur, &dst_box,
+		tex_options->base.clip, &tex_options->corners,
+		&tex_options->clipped_region, tex_options->clip_box, alpha);
+}
 
 void vk_color_transform_destroy(struct wlr_addon *addon) {
 	struct fx_vk_renderer *renderer = (struct fx_vk_renderer *)addon->owner;
@@ -1699,6 +1947,8 @@ struct fx_vk_render_pass *fx_vulkan_begin_render_pass(struct fx_vk_renderer *ren
 	wlr_render_pass_init(&pass->base, &render_pass_impl);
 	pass->renderer = renderer;
 	pass->two_pass = using_two_pass_pathway;
+	pass->has_blur = false;
+	pass->effect_buffers = NULL;
 	if (options != NULL && options->color_transform != NULL) {
 		pass->color_transform = wlr_color_transform_ref(options->color_transform);
 	}

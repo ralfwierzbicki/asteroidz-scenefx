@@ -2139,8 +2139,15 @@ static void scene_pass_add_blur(struct wlr_render_pass *pass,
 	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
 	if (fx != NULL) {
 		fx_render_pass_add_blur(fx, options);
+		return;
 	}
-	// no blur on non-GLES renderers
+#ifdef FX_HAS_VULKAN
+	if (fx_vk_render_pass_try_get(pass) != NULL) {
+		fx_vk_render_pass_add_blur(pass, options);
+		return;
+	}
+#endif
+	// no blur on other renderers
 }
 
 static bool scene_pass_add_optimized_blur(struct wlr_render_pass *pass,
@@ -2149,12 +2156,25 @@ static bool scene_pass_add_optimized_blur(struct wlr_render_pass *pass,
 	if (fx != NULL) {
 		return fx_render_pass_add_optimized_blur(fx, options);
 	}
+#ifdef FX_HAS_VULKAN
+	if (fx_vk_render_pass_try_get(pass) != NULL) {
+		return fx_vk_render_pass_add_optimized_blur(pass, options);
+	}
+#endif
 	return false;
 }
 
 static bool scene_pass_has_blur(struct wlr_render_pass *pass) {
 	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
-	return fx != NULL && fx->has_blur;
+	if (fx != NULL) {
+		return fx->has_blur;
+	}
+#ifdef FX_HAS_VULKAN
+	if (fx_vk_render_pass_try_get(pass) != NULL) {
+		return fx_vk_render_pass_has_blur(pass);
+	}
+#endif
+	return false;
 }
 
 static void scene_entry_render(struct render_list_entry *entry, const struct render_data *data) {
@@ -3753,6 +3773,27 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 		pixman_region32_fini(&blur_padding_region);
 		pixman_region32_fini(&original_damage);
 	}
+
+#ifdef FX_HAS_VULKAN
+	// fx_vk uses a full-damage path, so it skips the GLES blur_padding_region /
+	// should_compensate_blur machinery entirely. It just needs the per-output
+	// effect buffers attached and a flag noting whether any (enabled) blur node
+	// is present this frame.
+	if (fx_vk_render_pass_try_get(render_pass) != NULL) {
+		bool vk_has_blur = false;
+		if (is_scene_blur_enabled(&scene_output->scene->blur_data)) {
+			for (int i = 0; i < list_len; i++) {
+				enum wlr_scene_node_type type = list_data[i].node->type;
+				if (type == WLR_SCENE_NODE_BLUR ||
+						type == WLR_SCENE_NODE_OPTIMIZED_BLUR) {
+					vk_has_blur = true;
+					break;
+				}
+			}
+		}
+		fx_vk_render_pass_init_blur(render_pass, output, vk_has_blur);
+	}
+#endif
 
 	pixman_region32_t background;
 	pixman_region32_init(&background);

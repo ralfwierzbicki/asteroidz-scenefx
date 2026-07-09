@@ -46,6 +46,32 @@ void fx_vk_render_pass_add_texture(struct wlr_render_pass *pass,
 	const struct fx_render_texture_options *options);
 void fx_vk_render_pass_add_box_shadow(struct wlr_render_pass *pass,
 	const struct fx_render_box_shadow_options *options);
+
+/**
+ * Attaches the per-output blur/effect image set to the fx_vk pass and records
+ * whether the frame contains (enabled) blur nodes. No-op if `pass` is not an
+ * fx_vk pass. Called once during scene render setup.
+ */
+void fx_vk_render_pass_init_blur(struct wlr_render_pass *pass,
+	struct wlr_output *output, bool has_blur);
+
+/**
+ * Returns whether the fx_vk pass was flagged as containing blur nodes.
+ */
+bool fx_vk_render_pass_has_blur(struct wlr_render_pass *pass);
+
+/**
+ * Computes the cached whole-background (optimized) blur for the fx_vk pass.
+ * Returns true when the cache was (re)generated.
+ */
+bool fx_vk_render_pass_add_optimized_blur(struct wlr_render_pass *pass,
+	struct fx_render_blur_pass_options *options);
+
+/**
+ * Draws the cached background blur into the scene image at the node's box.
+ */
+void fx_vk_render_pass_add_blur(struct wlr_render_pass *pass,
+	struct fx_render_blur_pass_options *options);
 #endif
 
 #endif

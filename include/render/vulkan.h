@@ -276,6 +276,12 @@ struct fx_vk_effect_buffers {
 	struct fx_vk_effect_image *optimized_no_blur;
 	// Saved original pixels to repaint blur edge artifacts.
 	struct fx_vk_effect_image *blur_saved_pixels;
+
+	// Whether optimized_blur currently holds a valid cached background blur.
+	// Set once the optimized-blur pass has run for this (persistent) buffer set,
+	// cleared when the buffers are (re)created. add_blur bails when this is
+	// false so it never samples an uninitialized cache.
+	bool optimized_blur_valid;
 };
 
 // Final output framebuffer and image view
@@ -543,6 +549,11 @@ struct fx_vk_render_pass {
 	float projection[9];
 	bool failed;
 	bool two_pass; // rendering via intermediate blending buffer
+	// scenefx blur (fx_vk): set during scene setup when blur nodes are present
+	// and blur is enabled; effect_buffers is the per-output blur/effect image
+	// set (owned by the output, may be NULL if unavailable).
+	bool has_blur;
+	struct fx_vk_effect_buffers *effect_buffers;
 	struct wlr_color_transform *color_transform;
 
 	struct wlr_drm_syncobj_timeline *signal_timeline;
