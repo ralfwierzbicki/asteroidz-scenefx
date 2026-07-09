@@ -180,6 +180,10 @@ enum fx_vk_shader_source {
 	WLR_VK_SHADER_SOURCE_BLUR_EFFECTS,
 	// rounded rect with a linear/conic multi-stop gradient fill (fx_vk fork).
 	WLR_VK_SHADER_SOURCE_QUAD_GRAD_ROUND,
+	// masked rounded texture (fx_vk fork): the per-window/layer blur
+	// "ignore_transparent" path. Samples the blur cache at set 0 and a
+	// transparency-mask surface at set 1; uses the 2-set tex_mask_pipe_layout.
+	WLR_VK_SHADER_SOURCE_TEXTURE_MASK_ROUND,
 };
 
 // Constants used to pick the color transform for the blend-to-output
@@ -400,8 +404,16 @@ struct fx_vk_renderer {
 	VkShaderModule blur2_frag_module;
 	VkShaderModule blur_effects_frag_module;
 	VkShaderModule quad_grad_round_frag_module;
+	VkShaderModule tex_mask_round_frag_module;
 
 	struct wl_list pipeline_layouts; // struct fx_vk_pipeline_layout.link
+
+	// 2-set pipeline layout for masked per-window blur (ignore_transparent):
+	// set 0 = blur cache sampler, set 1 = transparency-mask sampler. Both sets
+	// reuse the BILINEAR tex DS layout; the fragment push range is extended to
+	// carry the mask uv/threshold block (fx_vk_frag_mask_pcr_data). Built in
+	// init_static_render_data, destroyed in fx_vulkan_destroy.
+	VkPipelineLayout tex_mask_pipe_layout;
 
 	// for blend->output subpass
 	VkPipelineLayout output_pipe_layout;
@@ -499,6 +511,24 @@ struct fx_vk_frag_corner_pcr_data {
 	float clip_size[2];
 	float clip_position[2];
 	float clip_radius[4];   // top_left, top_right, bottom_left, bottom_right
+};
+
+// Offset (bytes) at which the masked-blur transparency-mask block is pushed in
+// the fragment stage. The rounded corner block (fx_vk_frag_corner_pcr_data, 64
+// bytes) is pushed at 160 and ends at 224, so the mask block starts there. The
+// masked pipeline layout (tex_mask_pipe_layout) therefore extends its fragment
+// push range to 224 + sizeof(fx_vk_frag_mask_pcr_data) = 244, still within the
+// 256-byte maxPushConstantsSize budget (vert uses 0..80).
+#define FX_VK_TEX_MASK_PCR_OFFSET 224
+
+// Per-draw transparency-mask parameters for the masked per-window/layer blur
+// (fx_vk fork). std430 push-constant rules: two vec2 (8-byte aligned) followed
+// by a float, matching shaders/texture_mask_round.frag. The mask covers the
+// same dst box as the blur, so mask_uv = mask_uv_off + box_pos * mask_uv_size.
+struct fx_vk_frag_mask_pcr_data {
+	float mask_uv_off[2];
+	float mask_uv_size[2];
+	float threshold;
 };
 
 struct fx_vk_texture_view {

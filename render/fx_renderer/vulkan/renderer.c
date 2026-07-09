@@ -33,6 +33,7 @@
 #include "blur2.frag.h"
 #include "blur_effects.frag.h"
 #include "quad_grad_round.frag.h"
+#include "texture_mask_round.frag.h"
 #include "types/wlr_buffer.h"
 #include "util/time.h"
 
@@ -1472,6 +1473,9 @@ static void fx_vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 	vkDestroyShaderModule(dev->dev, renderer->blur2_frag_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->blur_effects_frag_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->quad_grad_round_frag_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->tex_mask_round_frag_module, NULL);
+
+	vkDestroyPipelineLayout(dev->dev, renderer->tex_mask_pipe_layout, NULL);
 
 	struct fx_vk_pipeline_layout *pipeline_layout, *pipeline_layout_tmp;
 	wl_list_for_each_safe(pipeline_layout, pipeline_layout_tmp,
@@ -2007,7 +2011,8 @@ static bool pipeline_key_equals(const struct fx_vk_pipeline_key *a,
 	}
 
 	if ((a->source == WLR_VK_SHADER_SOURCE_TEXTURE ||
-				a->source == WLR_VK_SHADER_SOURCE_TEXTURE_ROUND) &&
+				a->source == WLR_VK_SHADER_SOURCE_TEXTURE_ROUND ||
+				a->source == WLR_VK_SHADER_SOURCE_TEXTURE_MASK_ROUND) &&
 			a->texture_transform != b->texture_transform) {
 		return false;
 	}
@@ -2146,6 +2151,25 @@ struct fx_vk_pipeline *setup_get_or_create_pipeline(
 			.pName = "main",
 		};
 		break;
+	case WLR_VK_SHADER_SOURCE_TEXTURE_MASK_ROUND:
+		stages[1] = (VkPipelineShaderStageCreateInfo) {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.module = renderer->tex_mask_round_frag_module,
+			.pName = "main",
+			.pSpecializationInfo = &specialization,
+		};
+		break;
+	}
+
+	// The masked-blur source uses the 2-set tex_mask_pipe_layout (blur cache +
+	// mask samplers) rather than the shared 1-set tex layout. pipeline->layout
+	// still points at the 1-set fx_vk_pipeline_layout above so callers can reuse
+	// its DS layout + sampler for descriptor/view allocation, but the VkPipeline
+	// itself is created (and must be bound) with the 2-set layout.
+	VkPipelineLayout vk_pipe_layout = pipeline_layout->vk;
+	if (key->source == WLR_VK_SHADER_SOURCE_TEXTURE_MASK_ROUND) {
+		vk_pipe_layout = renderer->tex_mask_pipe_layout;
 	}
 
 	VkPipelineInputAssemblyStateCreateInfo assembly = {
@@ -2210,7 +2234,7 @@ struct fx_vk_pipeline *setup_get_or_create_pipeline(
 
 	VkGraphicsPipelineCreateInfo pinfo = {
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-		.layout = pipeline_layout->vk,
+		.layout = vk_pipe_layout,
 		.renderPass = setup->render_pass,
 		.subpass = 0,
 		.stageCount = sizeof(stages) / sizeof(stages[0]),
@@ -2700,6 +2724,62 @@ static bool init_static_render_data(struct fx_vk_renderer *renderer) {
 	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->quad_grad_round_frag_module);
 	if (res != VK_SUCCESS) {
 		fx_vk_error("Failed to create gradient quad fragment shader module", res);
+		return false;
+	}
+
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(texture_mask_round_frag_data),
+		.pCode = texture_mask_round_frag_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->tex_mask_round_frag_module);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create masked rounded tex fragment shader module", res);
+		return false;
+	}
+
+	// 2-set pipeline layout for the masked per-window/layer blur
+	// (ignore_transparent): set 0 = blur cache sampler, set 1 = transparency
+	// mask sampler. Both reuse the BILINEAR tex DS layout + immutable sampler,
+	// so the effect-image DS and the mask texture view DS (both allocated
+	// against that layout) are compatible with these set slots. The fragment
+	// push range is extended to 244 (FX_VK_TEX_MASK_PCR_OFFSET + mask block) to
+	// carry the mask uv/threshold constants on top of the base texture + corner
+	// blocks; vert stays at 0..80.
+	struct fx_vk_pipeline_layout *tex_layout = get_or_create_pipeline_layout(
+		renderer, &(struct fx_vk_pipeline_layout_key){
+			.filter_mode = WLR_SCALE_FILTER_BILINEAR });
+	if (tex_layout == NULL) {
+		return false;
+	}
+	const uint32_t vert_pcr_size = sizeof(struct fx_vk_vert_pcr_data); // 80
+	const uint32_t mask_frag_end =
+		FX_VK_TEX_MASK_PCR_OFFSET + sizeof(struct fx_vk_frag_mask_pcr_data); // 244
+	VkDescriptorSetLayout mask_set_layouts[] = {
+		tex_layout->ds, tex_layout->ds,
+	};
+	VkPushConstantRange mask_pc_ranges[] = {
+		{
+			.size = vert_pcr_size,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+		},
+		{
+			.offset = vert_pcr_size,
+			.size = mask_frag_end - vert_pcr_size,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+	};
+	VkPipelineLayoutCreateInfo mask_pl_info = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = 2,
+		.pSetLayouts = mask_set_layouts,
+		.pushConstantRangeCount = sizeof(mask_pc_ranges) / sizeof(mask_pc_ranges[0]),
+		.pPushConstantRanges = mask_pc_ranges,
+	};
+	res = vkCreatePipelineLayout(dev, &mask_pl_info, NULL,
+		&renderer->tex_mask_pipe_layout);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create masked-blur pipeline layout", res);
 		return false;
 	}
 

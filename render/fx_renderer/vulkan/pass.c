@@ -1658,6 +1658,184 @@ static void render_effect_image(struct fx_vk_render_pass *pass,
 	pixman_region32_fini(&clip_region);
 }
 
+// Masked variant of render_effect_image for the per-window/layer blur
+// "ignore_transparent" path. Draws the blur cache (src) at dst_box exactly like
+// render_effect_image, but additionally binds a transparency-mask texture at
+// set 1 and pushes its uv/threshold so the masked shader zeroes the blur where
+// the mask's alpha < threshold (letting the unblurred background show through
+// the mask's transparent holes). Mirrors the GLES stencil-mask path. The masked
+// shader is always the rounded variant; empty corners simply pass through.
+static void render_effect_image_masked(struct fx_vk_render_pass *pass,
+		struct fx_vk_effect_image *src, const struct wlr_box *dst_box,
+		const pixman_region32_t *clip, const struct fx_corner_fradii *corners,
+		const struct clipped_fregion *clipped_region,
+		const struct wlr_box *clip_box, float alpha,
+		const struct wlr_render_texture_options *mask_options, float threshold) {
+	struct fx_vk_renderer *renderer = pass->renderer;
+	VkCommandBuffer cb = pass->command_buffer->vk;
+
+	if (dst_box->width <= 0 || dst_box->height <= 0 ||
+			src->width <= 0 || src->height <= 0) {
+		return;
+	}
+
+	struct fx_vk_texture *mask = fx_vulkan_get_texture(mask_options->texture);
+	assert(mask->renderer == renderer);
+
+	// The mask view is allocated against the (non-YCbCr) BILINEAR tex layout, so
+	// a YCbCr mask can't be bound there. Transparency masks are RGBA surfaces in
+	// practice; bail to a plain (unmasked) blur draw rather than crash if not.
+	if (fx_vulkan_format_is_ycbcr(mask->format)) {
+		render_effect_image(pass, src, dst_box, clip, corners,
+			clipped_region, clip_box, alpha);
+		return;
+	}
+
+	if (mask->dmabuf_imported && !mask->owned) {
+		mask->owned = true;
+		assert(mask->foreign_link.prev == NULL);
+		assert(mask->foreign_link.next == NULL);
+		wl_list_insert(&renderer->foreign_textures, &mask->foreign_link);
+	}
+
+	struct wlr_fbox mask_src_box;
+	wlr_render_texture_options_get_src_box(mask_options, &mask_src_box);
+
+	float proj[9], matrix[9];
+	wlr_matrix_identity(proj);
+	wlr_matrix_project_box(matrix, dst_box, WL_OUTPUT_TRANSFORM_NORMAL, proj);
+	wlr_matrix_multiply(matrix, pass->projection, matrix);
+
+	struct fx_vk_vert_pcr_data vert_pcr_data = {
+		.uv_off = {
+			(float)dst_box->x / src->width,
+			(float)dst_box->y / src->height,
+		},
+		.uv_size = {
+			(float)dst_box->width / src->width,
+			(float)dst_box->height / src->height,
+		},
+	};
+	encode_proj_matrix(matrix, vert_pcr_data.mat4);
+
+	struct fx_vk_pipeline *pipe = setup_get_or_create_pipeline(
+		pass->render_setup,
+		&(struct fx_vk_pipeline_key) {
+			.source = WLR_VK_SHADER_SOURCE_TEXTURE_MASK_ROUND,
+			.layout = {
+				.filter_mode = WLR_SCALE_FILTER_BILINEAR,
+			},
+			.texture_transform = WLR_VK_TEXTURE_TRANSFORM_IDENTITY,
+			.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+		});
+	if (!pipe) {
+		pass->failed = true;
+		return;
+	}
+
+	// Bind the mask against the same 1-set tex layout the effect image DS uses,
+	// so both descriptor sets match the 2-set tex_mask_pipe_layout slots.
+	struct fx_vk_texture_view *mask_view =
+		fx_vulkan_texture_get_or_create_view(mask, pipe->layout, false);
+	if (!mask_view) {
+		pass->failed = true;
+		return;
+	}
+
+	float color_matrix[9];
+	wlr_matrix_identity(color_matrix);
+	struct fx_vk_frag_texture_pcr_data frag_pcr_data = {
+		.alpha = alpha,
+		.luminance_multiplier = 1,
+	};
+	encode_color_matrix(color_matrix, frag_pcr_data.matrix);
+
+	struct wlr_box corner_box = *dst_box;
+	if (clip_box != NULL && !wlr_box_empty(clip_box)) {
+		corner_box = *clip_box;
+	}
+	struct fx_vk_frag_corner_pcr_data corner_pcr;
+	fill_corner_pcr(&corner_pcr, &corner_box, corners, clipped_region);
+
+	// Mask uv over the same dst box, normalized by the mask texture size.
+	struct fx_vk_frag_mask_pcr_data mask_pcr = {
+		.mask_uv_off = {
+			(float)mask_src_box.x / mask_options->texture->width,
+			(float)mask_src_box.y / mask_options->texture->height,
+		},
+		.mask_uv_size = {
+			(float)mask_src_box.width / mask_options->texture->width,
+			(float)mask_src_box.height / mask_options->texture->height,
+		},
+		.threshold = threshold,
+	};
+
+	VkPipelineLayout vk_layout = renderer->tex_mask_pipe_layout;
+	VkDescriptorSet sets[] = { src->ds, mask_view->ds };
+
+	bind_pipeline(pass, pipe->vk);
+	vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		vk_layout, 0, 2, sets, 0, NULL);
+	vkCmdPushConstants(cb, vk_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+		sizeof(vert_pcr_data), &vert_pcr_data);
+	vkCmdPushConstants(cb, vk_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+		sizeof(vert_pcr_data), sizeof(frag_pcr_data), &frag_pcr_data);
+	vkCmdPushConstants(cb, vk_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+		FX_VK_TEX_ROUND_CORNER_OFFSET, sizeof(corner_pcr), &corner_pcr);
+	vkCmdPushConstants(cb, vk_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+		FX_VK_TEX_MASK_PCR_OFFSET, sizeof(mask_pcr), &mask_pcr);
+
+	pixman_region32_t clip_region;
+	get_clip_region(pass, clip, &clip_region);
+
+	int clip_rects_len;
+	const pixman_box32_t *clip_rects =
+		pixman_region32_rectangles(&clip_region, &clip_rects_len);
+	for (int i = 0; i < clip_rects_len; i++) {
+		VkRect2D rect;
+		convert_pixman_box_to_vk_rect(&clip_rects[i], &rect);
+		vkCmdSetScissor(cb, 0, 1, &rect);
+		vkCmdDraw(cb, 4, 1, 0, 0);
+
+		struct wlr_box clip_rect_box = {
+			.x = clip_rects[i].x1,
+			.y = clip_rects[i].y1,
+			.width = clip_rects[i].x2 - clip_rects[i].x1,
+			.height = clip_rects[i].y2 - clip_rects[i].y1,
+		};
+		struct wlr_box intersection;
+		if (wlr_box_intersection(&intersection, dst_box, &clip_rect_box)) {
+			render_pass_mark_box_updated(pass, &intersection);
+		}
+	}
+
+	mask->last_used_cb = pass->command_buffer;
+
+	pixman_region32_fini(&clip_region);
+
+	if (mask->dmabuf_imported || mask_options->wait_timeline != NULL) {
+		struct fx_vk_render_pass_texture *pass_texture =
+			wl_array_add(&pass->textures, sizeof(*pass_texture));
+		if (pass_texture == NULL) {
+			pass->failed = true;
+			return;
+		}
+
+		struct wlr_drm_syncobj_timeline *wait_timeline = NULL;
+		uint64_t wait_point = 0;
+		if (mask_options->wait_timeline != NULL) {
+			wait_timeline = wlr_drm_syncobj_timeline_ref(mask_options->wait_timeline);
+			wait_point = mask_options->wait_point;
+		}
+
+		*pass_texture = (struct fx_vk_render_pass_texture){
+			.texture = mask,
+			.wait_timeline = wait_timeline,
+			.wait_point = wait_point,
+		};
+	}
+}
+
 // Computes the cached whole-background (optimized) blur. The scene pass is
 // currently OPEN, so this splits it: end the scene pass, snapshot + blur the
 // scene image via transfers/effect passes, then restart the scene pass (its
@@ -1769,6 +1947,19 @@ void fx_vk_render_pass_add_blur(struct wlr_render_pass *wlr_pass,
 			src = fx_vk_render_pass_blur(pass, bufs, bufs->optimized_no_blur, &bd);
 			begin_scene_pass_reload(pass);
 		}
+	}
+
+	// ignore_transparent: a transparency-mask surface is attached (e.g. blur
+	// behind a semi-transparent layer-shell bar). Only show the blur where the
+	// mask's alpha >= transparency_threshold; elsewhere the unblurred background
+	// shows through. Mirrors GLES fx_render_pass_add_blur's stencil-mask path.
+	if (options->ignore_transparent && tex_options->base.texture != NULL &&
+			options->blur_data != NULL) {
+		render_effect_image_masked(pass, src, &dst_box,
+			tex_options->base.clip, &tex_options->corners,
+			&tex_options->clipped_region, tex_options->clip_box, alpha,
+			&tex_options->base, options->blur_data->transparency_threshold);
+		return;
 	}
 
 	render_effect_image(pass, src, &dst_box,
