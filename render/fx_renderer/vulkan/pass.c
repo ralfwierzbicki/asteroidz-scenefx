@@ -1662,6 +1662,25 @@ static void render_effect_image(struct fx_vk_render_pass *pass,
 // currently OPEN, so this splits it: end the scene pass, snapshot + blur the
 // scene image via transfers/effect passes, then restart the scene pass (its
 // loadOp is LOAD, so prior content is preserved).
+// Re-begin the scene render pass (loadOp LOAD) after a blur split ended it, so
+// the remaining scene nodes keep drawing into the scene image. Two-pass only.
+static void begin_scene_pass_reload(struct fx_vk_render_pass *pass) {
+	struct fx_vk_render_buffer *rb = pass->render_buffer;
+	int bw = rb->wlr_buffer->width, bh = rb->wlr_buffer->height;
+	VkRenderPassBeginInfo rp_info = {
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		.renderArea = { .extent = { bw, bh } },
+		.clearValueCount = 0,
+		.renderPass = rb->two_pass.render_setup->render_pass,
+		.framebuffer = rb->two_pass.scene_framebuffer,
+	};
+	vkCmdBeginRenderPass(pass->command_buffer->vk, &rp_info,
+		VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdSetViewport(pass->command_buffer->vk, 0, 1, &(VkViewport){
+		.width = bw, .height = bh, .maxDepth = 1 });
+	pass->bound_pipeline = VK_NULL_HANDLE;
+}
+
 bool fx_vk_render_pass_add_optimized_blur(struct wlr_render_pass *wlr_pass,
 		struct fx_render_blur_pass_options *options) {
 	struct fx_vk_render_pass *pass = fx_vk_render_pass_try_get(wlr_pass);
@@ -1681,8 +1700,6 @@ bool fx_vk_render_pass_add_optimized_blur(struct wlr_render_pass *wlr_pass,
 	struct fx_vk_render_buffer *render_buffer = pass->render_buffer;
 	VkCommandBuffer cb = pass->command_buffer->vk;
 	int width = bufs->width, height = bufs->height;
-	int buf_width = render_buffer->wlr_buffer->width;
-	int buf_height = render_buffer->wlr_buffer->height;
 
 	// Do not mutate the reference blur_data (matches GLES get_main_buffer_blur).
 	struct blur_data blur_data =
@@ -1711,21 +1728,7 @@ bool fx_vk_render_pass_add_optimized_blur(struct wlr_render_pass *wlr_pass,
 	bufs->optimized_blur_valid = true;
 
 	// Restart the scene pass so the remaining nodes keep drawing into it.
-	VkRect2D full_rect = { .extent = { buf_width, buf_height } };
-	VkRenderPassBeginInfo rp_info = {
-		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-		.renderArea = full_rect,
-		.clearValueCount = 0,
-		.renderPass = render_buffer->two_pass.render_setup->render_pass,
-		.framebuffer = render_buffer->two_pass.scene_framebuffer,
-	};
-	vkCmdBeginRenderPass(cb, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
-	vkCmdSetViewport(cb, 0, 1, &(VkViewport){
-		.width = buf_width,
-		.height = buf_height,
-		.maxDepth = 1,
-	});
-	pass->bound_pipeline = VK_NULL_HANDLE;
+	begin_scene_pass_reload(pass);
 
 	return !pass->failed;
 }
@@ -1750,7 +1753,25 @@ void fx_vk_render_pass_add_blur(struct wlr_render_pass *wlr_pass,
 	float alpha = tex_options->base.alpha != NULL ?
 		*tex_options->base.alpha : 1.0f;
 
-	render_effect_image(pass, bufs->optimized_blur, &dst_box,
+	// Source is the cached full-strength background blur. For blur_strength < 1
+	// (e.g. unfocused windows, config unfocused-strength) re-blur the unblurred
+	// snapshot at reduced strength instead — matches GLES fx_render_pass_add_blur
+	// (use_optimized_blur + has_strength -> re-blur optimized_no_blur). Needs a
+	// scene-pass split since the blur passes run with no render pass active.
+	struct fx_vk_effect_image *src = bufs->optimized_blur;
+	if (options->blur_strength < 1.0f && options->blur_data != NULL &&
+			pass->two_pass) {
+		struct blur_data bd =
+			blur_data_apply_strength(options->blur_data, options->blur_strength);
+		if (is_scene_blur_enabled(&bd)) {
+			vkCmdEndRenderPass(pass->command_buffer->vk);
+			pass->bound_pipeline = VK_NULL_HANDLE;
+			src = fx_vk_render_pass_blur(pass, bufs, bufs->optimized_no_blur, &bd);
+			begin_scene_pass_reload(pass);
+		}
+	}
+
+	render_effect_image(pass, src, &dst_box,
 		tex_options->base.clip, &tex_options->corners,
 		&tex_options->clipped_region, tex_options->clip_box, alpha);
 }
