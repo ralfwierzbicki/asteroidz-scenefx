@@ -28,6 +28,7 @@
 #include "output.frag.h"
 #include "quad_round.frag.h"
 #include "texture_round.frag.h"
+#include "box_shadow.frag.h"
 #include "types/wlr_buffer.h"
 #include "util/time.h"
 
@@ -1185,6 +1186,7 @@ static void fx_vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 	vkDestroyShaderModule(dev->dev, renderer->output_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->quad_round_frag_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->tex_round_frag_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->box_shadow_frag_module, NULL);
 
 	struct fx_vk_pipeline_layout *pipeline_layout, *pipeline_layout_tmp;
 	wl_list_for_each_safe(pipeline_layout, pipeline_layout_tmp,
@@ -1797,6 +1799,14 @@ struct fx_vk_pipeline *setup_get_or_create_pipeline(
 			.pSpecializationInfo = &specialization,
 		};
 		break;
+	case WLR_VK_SHADER_SOURCE_BOX_SHADOW:
+		stages[1] = (VkPipelineShaderStageCreateInfo) {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.module = renderer->box_shadow_frag_module,
+			.pName = "main",
+		};
+		break;
 	}
 
 	VkPipelineInputAssemblyStateCreateInfo assembly = {
@@ -2296,6 +2306,17 @@ static bool init_static_render_data(struct fx_vk_renderer *renderer) {
 	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->tex_round_frag_module);
 	if (res != VK_SUCCESS) {
 		fx_vk_error("Failed to create rounded tex fragment shader module", res);
+		return false;
+	}
+
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(box_shadow_frag_data),
+		.pCode = box_shadow_frag_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->box_shadow_frag_module);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create box-shadow fragment shader module", res);
 		return false;
 	}
 

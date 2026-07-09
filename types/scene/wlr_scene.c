@@ -2123,8 +2123,15 @@ static void scene_pass_add_box_shadow(struct wlr_render_pass *pass,
 	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
 	if (fx != NULL) {
 		fx_render_pass_add_box_shadow(fx, options);
+		return;
 	}
-	// no shadow on non-GLES renderers
+#ifdef FX_HAS_VULKAN
+	if (fx_vk_render_pass_try_get(pass) != NULL) {
+		fx_vk_render_pass_add_box_shadow(pass, options);
+		return;
+	}
+#endif
+	// no shadow on other renderers
 }
 
 static void scene_pass_add_blur(struct wlr_render_pass *pass,

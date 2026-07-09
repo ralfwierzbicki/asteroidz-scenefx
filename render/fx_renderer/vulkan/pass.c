@@ -15,6 +15,9 @@
 // declarations in shaders/quad_round.frag and shaders/texture_round.frag.
 #define FX_VK_QUAD_ROUND_CORNER_OFFSET 96
 #define FX_VK_TEX_ROUND_CORNER_OFFSET 160
+// box_shadow.frag reuses the quad corner block at 96 (ends at 160) and appends
+// the scalar blur_sigma at 160. Must match shaders/box_shadow.frag.
+#define FX_VK_BOX_SHADOW_BLUR_OFFSET 160
 
 static const struct wlr_render_pass_impl render_pass_impl;
 static const struct wlr_addon_interface vk_color_transform_impl;
@@ -1176,6 +1179,101 @@ void fx_vk_render_pass_add_rounded_rect_grad(struct wlr_render_pass *wlr_pass,
 	}
 	render_rounded_rect(get_render_pass(wlr_pass), &base,
 		&options->corners, &options->clipped_region);
+}
+
+// Box shadow via the fast rounded-rectangle gaussian (see box_shadow.frag).
+// Pushes the shadow colour (linearised, straight alpha), the shared corner +
+// interior-clip block, and the scalar blur_sigma, then draws the shadow box.
+static void render_box_shadow(struct fx_vk_render_pass *pass,
+		const struct fx_render_box_shadow_options *options) {
+	VkCommandBuffer cb = pass->command_buffer->vk;
+
+	struct wlr_box box = options->box;
+	if (box.width <= 0 || box.height <= 0) {
+		return;
+	}
+
+	// Shadow colour lives in linear space (the fx_vk targets are linear); alpha
+	// stays straight and is modulated per-pixel by the shadow mask, then
+	// premultiplied in the shader for the premultiplied-blend pipeline.
+	float linear_color[] = {
+		color_to_linear(options->color.r),
+		color_to_linear(options->color.g),
+		color_to_linear(options->color.b),
+		options->color.a,
+	};
+
+	pixman_region32_t clip;
+	get_clip_region(pass, options->clip, &clip);
+
+	int clip_rects_len;
+	const pixman_box32_t *clip_rects = pixman_region32_rectangles(&clip, &clip_rects_len);
+	for (int i = 0; i < clip_rects_len; i++) {
+		struct wlr_box clip_box = {
+			.x = clip_rects[i].x1,
+			.y = clip_rects[i].y1,
+			.width = clip_rects[i].x2 - clip_rects[i].x1,
+			.height = clip_rects[i].y2 - clip_rects[i].y1,
+		};
+		struct wlr_box intersection;
+		if (wlr_box_intersection(&intersection, &box, &clip_box)) {
+			render_pass_mark_box_updated(pass, &intersection);
+		}
+	}
+
+	float proj[9], matrix[9];
+	wlr_matrix_identity(proj);
+	wlr_matrix_project_box(matrix, &box, WL_OUTPUT_TRANSFORM_NORMAL, proj);
+	wlr_matrix_multiply(matrix, pass->projection, matrix);
+
+	struct fx_vk_pipeline *pipe = setup_get_or_create_pipeline(
+		pass->render_setup,
+		&(struct fx_vk_pipeline_key) {
+			.source = WLR_VK_SHADER_SOURCE_BOX_SHADOW,
+			.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+			.layout = {0},
+		});
+	if (!pipe) {
+		pass->failed = true;
+		pixman_region32_fini(&clip);
+		return;
+	}
+
+	struct fx_vk_vert_pcr_data vert_pcr_data = {
+		.uv_off = { 0, 0 },
+		.uv_size = { 1, 1 },
+	};
+	encode_proj_matrix(matrix, vert_pcr_data.mat4);
+
+	struct fx_vk_frag_corner_pcr_data corner_pcr;
+	fill_corner_pcr(&corner_pcr, &box, &options->corners, &options->clipped_region);
+
+	float blur_sigma = options->blur_sigma;
+
+	bind_pipeline(pass, pipe->vk);
+	vkCmdPushConstants(cb, pipe->layout->vk,
+		VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vert_pcr_data), &vert_pcr_data);
+	vkCmdPushConstants(cb, pipe->layout->vk,
+		VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(vert_pcr_data),
+		sizeof(float) * 4, linear_color);
+	vkCmdPushConstants(cb, pipe->layout->vk, VK_SHADER_STAGE_FRAGMENT_BIT,
+		FX_VK_QUAD_ROUND_CORNER_OFFSET, sizeof(corner_pcr), &corner_pcr);
+	vkCmdPushConstants(cb, pipe->layout->vk, VK_SHADER_STAGE_FRAGMENT_BIT,
+		FX_VK_BOX_SHADOW_BLUR_OFFSET, sizeof(blur_sigma), &blur_sigma);
+
+	for (int i = 0; i < clip_rects_len; i++) {
+		VkRect2D rect;
+		convert_pixman_box_to_vk_rect(&clip_rects[i], &rect);
+		vkCmdSetScissor(cb, 0, 1, &rect);
+		vkCmdDraw(cb, 4, 1, 0, 0);
+	}
+
+	pixman_region32_fini(&clip);
+}
+
+void fx_vk_render_pass_add_box_shadow(struct wlr_render_pass *wlr_pass,
+		const struct fx_render_box_shadow_options *options) {
+	render_box_shadow(get_render_pass(wlr_pass), options);
 }
 
 

@@ -6,6 +6,7 @@ vulkan_shaders_src = [
 	# scenefx effect shaders (fx_vk fork)
 	'quad_round.frag',
 	'texture_round.frag',
+	'box_shadow.frag',
 ]
 
 vulkan_shaders = []

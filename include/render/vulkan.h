@@ -171,6 +171,7 @@ enum fx_vk_shader_source {
 	// per-draw corner data from push constants.
 	WLR_VK_SHADER_SOURCE_QUAD_ROUND,
 	WLR_VK_SHADER_SOURCE_TEXTURE_ROUND,
+	WLR_VK_SHADER_SOURCE_BOX_SHADOW,
 };
 
 // Constants used to pick the color transform for the blend-to-output
@@ -310,6 +311,7 @@ struct fx_vk_renderer {
 	// scenefx effect shaders (fx_vk fork)
 	VkShaderModule quad_round_frag_module;
 	VkShaderModule tex_round_frag_module;
+	VkShaderModule box_shadow_frag_module;
 
 	struct wl_list pipeline_layouts; // struct fx_vk_pipeline_layout.link
 
