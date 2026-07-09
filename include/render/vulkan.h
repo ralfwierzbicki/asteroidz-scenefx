@@ -172,6 +172,12 @@ enum fx_vk_shader_source {
 	WLR_VK_SHADER_SOURCE_QUAD_ROUND,
 	WLR_VK_SHADER_SOURCE_TEXTURE_ROUND,
 	WLR_VK_SHADER_SOURCE_BOX_SHADOW,
+	// dual-Kawase blur (fx_vk fork): downsample, upsample, and the post
+	// brightness/contrast/saturation/noise pass. All sample set 0 (the tex
+	// layout's combined image sampler) and read params from push constants.
+	WLR_VK_SHADER_SOURCE_BLUR1,
+	WLR_VK_SHADER_SOURCE_BLUR2,
+	WLR_VK_SHADER_SOURCE_BLUR_EFFECTS,
 };
 
 // Constants used to pick the color transform for the blend-to-output
@@ -221,6 +227,48 @@ struct fx_vk_render_format_setup {
 
 	struct fx_vk_renderer *renderer;
 	struct wl_list pipelines; // struct fx_vk_pipeline.link
+};
+
+// scenefx effect (blur) offscreen image (fx_vk fork). A device-local 16F image
+// that is BOTH a colour attachment (blur passes render into it) and a sampled
+// texture (the next blur pass / the blur node samples it). Kept in
+// VK_IMAGE_LAYOUT_GENERAL for its whole life so ping-pong passes need no manual
+// layout transitions — the effect render pass uses GENERAL init/final and its
+// subpass dependencies guard the colour-write -> shader-read hazard.
+struct fx_vk_effect_image {
+	struct fx_vk_renderer *renderer;
+	int width, height;
+
+	VkImage image;
+	VkDeviceMemory memory;
+	VkImageView image_view;
+	VkFramebuffer framebuffer;
+
+	// Sampled descriptor (COMBINED_IMAGE_SAMPLER) for reading this image, and
+	// the tex pipeline layout it (and the blur pipelines) are bound with.
+	VkDescriptorSet ds;
+	struct fx_vk_descriptor_pool *ds_pool;
+	const struct fx_vk_pipeline_layout *layout;
+	struct fx_vk_render_format_setup *render_setup; // 16F effect render pass
+};
+
+// Per-output set of effect images, mirroring the GLES fx_offscreen_buffers.
+// Persists across frames (attached to the wlr_output via an addon) so the
+// optimized-blur cache survives. Sized to the output; recreated on resize.
+struct fx_vk_effect_buffers {
+	struct wl_list link; // fx_vk_renderer.effect_buffers
+	struct wlr_addon addon;
+	struct fx_vk_renderer *renderer;
+	int width, height;
+
+	// Blur ping-pong pair.
+	struct fx_vk_effect_image *effects;
+	struct fx_vk_effect_image *effects_swapped;
+	// Cached whole-background blur + its unblurred source (for strength<1).
+	struct fx_vk_effect_image *optimized_blur;
+	struct fx_vk_effect_image *optimized_no_blur;
+	// Saved original pixels to repaint blur edge artifacts.
+	struct fx_vk_effect_image *blur_saved_pixels;
 };
 
 // Final output framebuffer and image view
@@ -277,6 +325,16 @@ bool fx_vulkan_setup_one_pass_framebuffer(struct fx_vk_render_buffer *buffer,
 bool fx_vulkan_setup_two_pass_framebuffer(struct fx_vk_render_buffer *buffer,
 	const struct wlr_dmabuf_attributes *dmabuf);
 
+// scenefx effect (blur) offscreen buffers (fx_vk fork).
+struct fx_vk_effect_image *fx_vk_effect_image_create(
+	struct fx_vk_renderer *renderer, int width, int height);
+void fx_vk_effect_image_destroy(struct fx_vk_effect_image *img);
+// Per-output effect-buffer set, created/resized lazily and cached on the output.
+struct fx_vk_effect_buffers *fx_vk_effect_buffers_get(
+	struct fx_vk_renderer *renderer, struct wlr_output *output,
+	int width, int height);
+void fx_vk_effect_buffers_destroy(struct fx_vk_effect_buffers *bufs);
+
 struct fx_vk_command_buffer {
 	VkCommandBuffer vk;
 	bool recording;
@@ -312,6 +370,9 @@ struct fx_vk_renderer {
 	VkShaderModule quad_round_frag_module;
 	VkShaderModule tex_round_frag_module;
 	VkShaderModule box_shadow_frag_module;
+	VkShaderModule blur1_frag_module;
+	VkShaderModule blur2_frag_module;
+	VkShaderModule blur_effects_frag_module;
 
 	struct wl_list pipeline_layouts; // struct fx_vk_pipeline_layout.link
 
@@ -339,6 +400,7 @@ struct fx_vk_renderer {
 	size_t last_pool_size;
 	struct wl_list descriptor_pools; // fx_vk_descriptor_pool.link
 	struct wl_list render_format_setups; // fx_vk_render_format_setup.link
+	struct wl_list effect_buffers; // fx_vk_effect_buffers.link (blur, per-output)
 
 
 	struct wl_list textures; // fx_vk_texture.link

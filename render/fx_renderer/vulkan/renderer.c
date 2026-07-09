@@ -29,6 +29,9 @@
 #include "quad_round.frag.h"
 #include "texture_round.frag.h"
 #include "box_shadow.frag.h"
+#include "blur1.frag.h"
+#include "blur2.frag.h"
+#include "blur_effects.frag.h"
 #include "types/wlr_buffer.h"
 #include "util/time.h"
 
@@ -823,6 +826,251 @@ error:
 	return false;
 }
 
+// ---- scenefx effect (blur) offscreen images (fx_vk fork) --------------------
+
+void fx_vk_effect_image_destroy(struct fx_vk_effect_image *img) {
+	if (img == NULL) {
+		return;
+	}
+	VkDevice dev = img->renderer->dev->dev;
+	if (img->ds_pool) {
+		fx_vulkan_free_ds(img->renderer, img->ds_pool, img->ds);
+	}
+	if (img->framebuffer) {
+		vkDestroyFramebuffer(dev, img->framebuffer, NULL);
+	}
+	if (img->image_view) {
+		vkDestroyImageView(dev, img->image_view, NULL);
+	}
+	if (img->image) {
+		vkDestroyImage(dev, img->image, NULL);
+	}
+	if (img->memory) {
+		vkFreeMemory(dev, img->memory, NULL);
+	}
+	free(img);
+}
+
+struct fx_vk_effect_image *fx_vk_effect_image_create(
+		struct fx_vk_renderer *renderer, int width, int height) {
+	if (width <= 0 || height <= 0) {
+		return NULL;
+	}
+	VkDevice dev = renderer->dev->dev;
+	VkResult res;
+
+	// 16F effect render pass (single subpass, GENERAL init/final so the image
+	// is both renderable and samplable without manual layout transitions).
+	const struct fx_vk_format *fmt =
+		fx_vulkan_get_format_from_drm(DRM_FORMAT_ABGR16161616F);
+	if (fmt == NULL) {
+		wlr_log(WLR_ERROR, "fx_vk: no 16F format for effect buffers");
+		return NULL;
+	}
+	struct fx_vk_render_format_setup *setup =
+		find_or_create_render_setup(renderer, fmt, false, false);
+	if (setup == NULL) {
+		return NULL;
+	}
+	// Tex pipeline layout: provides the immutable sampler + the set-0 layout
+	// the blur pipelines bind, and the DS layout for the sampled descriptor.
+	struct fx_vk_pipeline_layout *layout = get_or_create_pipeline_layout(renderer,
+		&(struct fx_vk_pipeline_layout_key){ .filter_mode = WLR_SCALE_FILTER_BILINEAR });
+	if (layout == NULL) {
+		return NULL;
+	}
+
+	struct fx_vk_effect_image *img = calloc(1, sizeof(*img));
+	if (img == NULL) {
+		return NULL;
+	}
+	img->renderer = renderer;
+	img->width = width;
+	img->height = height;
+	img->render_setup = setup;
+	img->layout = layout;
+
+	VkImageCreateInfo img_info = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = fmt->vk,
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.tiling = VK_IMAGE_TILING_OPTIMAL,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.extent = (VkExtent3D){ width, height, 1 },
+		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	};
+	res = vkCreateImage(dev, &img_info, NULL, &img->image);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("effect vkCreateImage failed", res);
+		goto error;
+	}
+
+	VkMemoryRequirements mem_reqs;
+	vkGetImageMemoryRequirements(dev, img->image, &mem_reqs);
+	int mem_type_index = fx_vulkan_find_mem_type(renderer->dev,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, mem_reqs.memoryTypeBits);
+	if (mem_type_index == -1) {
+		wlr_log(WLR_ERROR, "effect: no suitable vulkan memory type");
+		goto error;
+	}
+	VkMemoryAllocateInfo mem_info = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize = mem_reqs.size,
+		.memoryTypeIndex = mem_type_index,
+	};
+	res = vkAllocateMemory(dev, &mem_info, NULL, &img->memory);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("effect vkAllocateMemory failed", res);
+		goto error;
+	}
+	res = vkBindImageMemory(dev, img->image, img->memory, 0);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("effect vkBindImageMemory failed", res);
+		goto error;
+	}
+
+	VkImageViewCreateInfo view_info = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image = img->image,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = fmt->vk,
+		.components.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+		.components.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+		.components.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+		.components.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+		.subresourceRange = (VkImageSubresourceRange){
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.levelCount = 1,
+			.layerCount = 1,
+		},
+	};
+	res = vkCreateImageView(dev, &view_info, NULL, &img->image_view);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("effect vkCreateImageView failed", res);
+		goto error;
+	}
+
+	VkFramebufferCreateInfo fb_info = {
+		.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		.attachmentCount = 1,
+		.pAttachments = &img->image_view,
+		.width = width,
+		.height = height,
+		.layers = 1,
+		.renderPass = setup->render_pass,
+	};
+	res = vkCreateFramebuffer(dev, &fb_info, NULL, &img->framebuffer);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("effect vkCreateFramebuffer failed", res);
+		goto error;
+	}
+
+	// Sampled descriptor (immutable sampler baked into the layout).
+	img->ds_pool = fx_vulkan_alloc_texture_ds(renderer, layout->ds, &img->ds);
+	if (img->ds_pool == NULL) {
+		wlr_log(WLR_ERROR, "effect: failed to allocate descriptor");
+		goto error;
+	}
+	VkDescriptorImageInfo ds_img_info = {
+		.imageView = img->image_view,
+		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+	};
+	VkWriteDescriptorSet ds_write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.dstSet = img->ds,
+		.pImageInfo = &ds_img_info,
+	};
+	vkUpdateDescriptorSets(dev, 1, &ds_write, 0, NULL);
+
+	// Move UNDEFINED -> GENERAL up-front so the effect render pass (initial
+	// layout GENERAL) and later sampling are both valid. Recorded on the stage
+	// command buffer, which flushes before this image is used.
+	VkCommandBuffer cb = fx_vulkan_record_stage_cb(renderer);
+	fx_vulkan_change_layout(cb, img->image,
+		VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+		VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+
+	return img;
+
+error:
+	fx_vk_effect_image_destroy(img);
+	return NULL;
+}
+
+static void effect_buffers_addon_destroy(struct wlr_addon *addon) {
+	struct fx_vk_effect_buffers *bufs = wl_container_of(addon, bufs, addon);
+	fx_vk_effect_buffers_destroy(bufs);
+}
+
+static const struct wlr_addon_interface effect_buffers_addon_impl = {
+	.name = "fx_vk_effect_buffers",
+	.destroy = effect_buffers_addon_destroy,
+};
+
+void fx_vk_effect_buffers_destroy(struct fx_vk_effect_buffers *bufs) {
+	if (bufs == NULL) {
+		return;
+	}
+	fx_vk_effect_image_destroy(bufs->effects);
+	fx_vk_effect_image_destroy(bufs->effects_swapped);
+	fx_vk_effect_image_destroy(bufs->optimized_blur);
+	fx_vk_effect_image_destroy(bufs->optimized_no_blur);
+	fx_vk_effect_image_destroy(bufs->blur_saved_pixels);
+	wl_list_remove(&bufs->link);
+	wlr_addon_finish(&bufs->addon);
+	free(bufs);
+}
+
+struct fx_vk_effect_buffers *fx_vk_effect_buffers_get(
+		struct fx_vk_renderer *renderer, struct wlr_output *output,
+		int width, int height) {
+	struct wlr_addon *addon =
+		wlr_addon_find(&output->addons, renderer, &effect_buffers_addon_impl);
+	if (addon != NULL) {
+		struct fx_vk_effect_buffers *bufs = wl_container_of(addon, bufs, addon);
+		if (bufs->width == width && bufs->height == height) {
+			return bufs;
+		}
+		// Output resized: rebuild at the new size.
+		fx_vk_effect_buffers_destroy(bufs);
+	}
+
+	struct fx_vk_effect_buffers *bufs = calloc(1, sizeof(*bufs));
+	if (bufs == NULL) {
+		return NULL;
+	}
+	bufs->renderer = renderer;
+	bufs->width = width;
+	bufs->height = height;
+	bufs->effects = fx_vk_effect_image_create(renderer, width, height);
+	bufs->effects_swapped = fx_vk_effect_image_create(renderer, width, height);
+	bufs->optimized_blur = fx_vk_effect_image_create(renderer, width, height);
+	bufs->optimized_no_blur = fx_vk_effect_image_create(renderer, width, height);
+	bufs->blur_saved_pixels = fx_vk_effect_image_create(renderer, width, height);
+	if (!bufs->effects || !bufs->effects_swapped || !bufs->optimized_blur
+			|| !bufs->optimized_no_blur || !bufs->blur_saved_pixels) {
+		fx_vk_effect_image_destroy(bufs->effects);
+		fx_vk_effect_image_destroy(bufs->effects_swapped);
+		fx_vk_effect_image_destroy(bufs->optimized_blur);
+		fx_vk_effect_image_destroy(bufs->optimized_no_blur);
+		fx_vk_effect_image_destroy(bufs->blur_saved_pixels);
+		free(bufs);
+		return NULL;
+	}
+
+	wlr_addon_init(&bufs->addon, &output->addons, renderer,
+		&effect_buffers_addon_impl);
+	wl_list_insert(&renderer->effect_buffers, &bufs->link);
+	return bufs;
+}
+
 bool fx_vulkan_setup_one_pass_framebuffer(struct fx_vk_render_buffer *buffer,
 		const struct wlr_dmabuf_attributes *dmabuf, bool srgb) {
 	struct fx_vk_renderer *renderer = buffer->renderer;
@@ -1187,6 +1435,9 @@ static void fx_vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 	vkDestroyShaderModule(dev->dev, renderer->quad_round_frag_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->tex_round_frag_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->box_shadow_frag_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->blur1_frag_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->blur2_frag_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->blur_effects_frag_module, NULL);
 
 	struct fx_vk_pipeline_layout *pipeline_layout, *pipeline_layout_tmp;
 	wl_list_for_each_safe(pipeline_layout, pipeline_layout_tmp,
@@ -1807,6 +2058,30 @@ struct fx_vk_pipeline *setup_get_or_create_pipeline(
 			.pName = "main",
 		};
 		break;
+	case WLR_VK_SHADER_SOURCE_BLUR1:
+		stages[1] = (VkPipelineShaderStageCreateInfo) {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.module = renderer->blur1_frag_module,
+			.pName = "main",
+		};
+		break;
+	case WLR_VK_SHADER_SOURCE_BLUR2:
+		stages[1] = (VkPipelineShaderStageCreateInfo) {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.module = renderer->blur2_frag_module,
+			.pName = "main",
+		};
+		break;
+	case WLR_VK_SHADER_SOURCE_BLUR_EFFECTS:
+		stages[1] = (VkPipelineShaderStageCreateInfo) {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.module = renderer->blur_effects_frag_module,
+			.pName = "main",
+		};
+		break;
 	}
 
 	VkPipelineInputAssemblyStateCreateInfo assembly = {
@@ -2320,6 +2595,39 @@ static bool init_static_render_data(struct fx_vk_renderer *renderer) {
 		return false;
 	}
 
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(blur1_frag_data),
+		.pCode = blur1_frag_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->blur1_frag_module);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create blur1 fragment shader module", res);
+		return false;
+	}
+
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(blur2_frag_data),
+		.pCode = blur2_frag_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->blur2_frag_module);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create blur2 fragment shader module", res);
+		return false;
+	}
+
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(blur_effects_frag_data),
+		.pCode = blur_effects_frag_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->blur_effects_frag_module);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create blur-effects fragment shader module", res);
+		return false;
+	}
+
 	return true;
 }
 
@@ -2629,6 +2937,7 @@ struct wlr_renderer *fx_vulkan_renderer_create_for_device(struct fx_vk_device *d
 	wl_list_init(&renderer->descriptor_pools);
 	wl_list_init(&renderer->output_descriptor_pools);
 	wl_list_init(&renderer->render_format_setups);
+	wl_list_init(&renderer->effect_buffers);
 	wl_list_init(&renderer->render_buffers);
 	wl_list_init(&renderer->color_transforms);
 	wl_list_init(&renderer->pipeline_layouts);
