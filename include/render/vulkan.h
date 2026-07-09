@@ -166,6 +166,11 @@ enum fx_vk_texture_transform {
 enum fx_vk_shader_source {
 	WLR_VK_SHADER_SOURCE_TEXTURE,
 	WLR_VK_SHADER_SOURCE_SINGLE_COLOR,
+	// scenefx effect sources (fx_vk fork): rounded-corner variants of the two
+	// base sources above. They share the same pipeline layout but read extra
+	// per-draw corner data from push constants.
+	WLR_VK_SHADER_SOURCE_QUAD_ROUND,
+	WLR_VK_SHADER_SOURCE_TEXTURE_ROUND,
 };
 
 // Constants used to pick the color transform for the blend-to-output
@@ -302,6 +307,9 @@ struct fx_vk_renderer {
 	VkShaderModule tex_frag_module;
 	VkShaderModule quad_frag_module;
 	VkShaderModule output_module;
+	// scenefx effect shaders (fx_vk fork)
+	VkShaderModule quad_round_frag_module;
+	VkShaderModule tex_round_frag_module;
 
 	struct wl_list pipeline_layouts; // struct fx_vk_pipeline_layout.link
 
@@ -374,6 +382,29 @@ struct fx_vk_frag_output_pcr_data {
 	float matrix[4][4]; // only a 3x3 subset is used
 	float lut_3d_offset;
 	float lut_3d_scale;
+};
+
+// Per-draw rounded-corner + interior-clip parameters for scenefx's rounded
+// rect / rounded texture effects (fx_vk fork).
+//
+// Delivered via push constants: the target GPU reports maxPushConstantsSize
+// = 256, and the worst case (rounded texture) needs vert(80) + frag_texture
+// (72, padded to 80) + corner(64) = 224 bytes, which fits. The rounded quad
+// needs vert(80) + color(16) + corner(64) = 160 bytes. If a device ever
+// reports a smaller limit, only the rounded pipeline layout creation fails and
+// those effects degrade to no-ops; base texture/rect rendering is unaffected.
+//
+// Layout matches std430 push-constant rules: vec4-aligned members (radius,
+// clip_radius) sit at 16-byte-aligned offsets within the struct, and the
+// struct itself is always pushed at a 16-byte-aligned offset (96 for the quad,
+// 160 for the texture).
+struct fx_vk_frag_corner_pcr_data {
+	float size[2];          // rect/texture size in buffer pixels
+	float position[2];      // rect/texture top-left in buffer pixels
+	float radius[4];        // top_left, top_right, bottom_left, bottom_right
+	float clip_size[2];
+	float clip_position[2];
+	float clip_radius[4];   // top_left, top_right, bottom_left, bottom_right
 };
 
 struct fx_vk_texture_view {

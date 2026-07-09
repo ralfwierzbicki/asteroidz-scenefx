@@ -7,8 +7,14 @@
 #include <wlr/render/drm_syncobj.h>
 
 #include "render/color.h"
+#include "render/pass.h"
 #include "render/vulkan.h"
 #include "util/matrix.h"
+
+// Corner-block push-constant offsets. Must match the `layout(offset = ...)`
+// declarations in shaders/quad_round.frag and shaders/texture_round.frag.
+#define FX_VK_QUAD_ROUND_CORNER_OFFSET 96
+#define FX_VK_TEX_ROUND_CORNER_OFFSET 160
 
 static const struct wlr_render_pass_impl render_pass_impl;
 static const struct wlr_addon_interface vk_color_transform_impl;
@@ -783,11 +789,42 @@ static void render_pass_add_rect(struct wlr_render_pass *wlr_pass,
 	pixman_region32_fini(&clip);
 }
 
-static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
-		const struct wlr_render_texture_options *options) {
-	struct fx_vk_render_pass *pass = get_render_pass(wlr_pass);
+// Fills the shared rounded-corner push-constant block from an effect box, its
+// corner radii and an interior clip cutout. Radii order matches the shader and
+// GLES uniform_corner_radii_set(): tl, tr, bl, br.
+static void fill_corner_pcr(struct fx_vk_frag_corner_pcr_data *out,
+		const struct wlr_box *box, const struct fx_corner_fradii *corners,
+		const struct clipped_fregion *clip) {
+	out->size[0] = box->width;
+	out->size[1] = box->height;
+	out->position[0] = box->x;
+	out->position[1] = box->y;
+	out->radius[0] = corners->top_left;
+	out->radius[1] = corners->top_right;
+	out->radius[2] = corners->bottom_left;
+	out->radius[3] = corners->bottom_right;
+	out->clip_size[0] = clip->area.width;
+	out->clip_size[1] = clip->area.height;
+	out->clip_position[0] = clip->area.x;
+	out->clip_position[1] = clip->area.y;
+	out->clip_radius[0] = clip->corners.top_left;
+	out->clip_radius[1] = clip->corners.top_right;
+	out->clip_radius[2] = clip->corners.bottom_left;
+	out->clip_radius[3] = clip->corners.bottom_right;
+}
+
+// Core texture draw. When fx_options is non-NULL and carries rounded corners or
+// an interior clip cutout, the rounded-texture pipeline + corner push constants
+// are used; otherwise this is byte-identical to the base wlroots texture path.
+static void render_texture(struct fx_vk_render_pass *pass,
+		const struct wlr_render_texture_options *options,
+		const struct fx_render_texture_options *fx_options) {
 	struct fx_vk_renderer *renderer = pass->renderer;
 	VkCommandBuffer cb = pass->command_buffer->vk;
+
+	bool use_effects = fx_options != NULL &&
+		(!fx_corner_fradii_is_empty(&fx_options->corners) ||
+			clipped_fregion_is_valid(&fx_options->clipped_region));
 
 	struct fx_vk_texture *texture = fx_vulkan_get_texture(options->texture);
 	assert(texture->renderer == renderer);
@@ -869,10 +906,18 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 		color_range = WLR_COLOR_RANGE_LIMITED;
 	}
 
+	// Rounded corners / interior cutout produce partial edge coverage, so we
+	// must always alpha-blend (never the opaque NONE fast path).
+	enum wlr_render_blend_mode blend_mode = use_effects ?
+		WLR_RENDER_BLEND_MODE_PREMULTIPLIED :
+		(!texture->has_alpha && alpha == 1.0 ?
+			WLR_RENDER_BLEND_MODE_NONE : options->blend_mode);
+
 	struct fx_vk_pipeline *pipe = setup_get_or_create_pipeline(
 		pass->render_setup,
 		&(struct fx_vk_pipeline_key) {
-			.source = WLR_VK_SHADER_SOURCE_TEXTURE,
+			.source = use_effects ?
+				WLR_VK_SHADER_SOURCE_TEXTURE_ROUND : WLR_VK_SHADER_SOURCE_TEXTURE,
 			.layout = {
 				.ycbcr = {
 					.format = is_ycbcr ? texture->format : NULL,
@@ -882,8 +927,7 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 				.filter_mode = options->filter_mode,
 			},
 			.texture_transform = tex_transform,
-			.blend_mode = !texture->has_alpha && alpha == 1.0 ?
-				WLR_RENDER_BLEND_MODE_NONE : options->blend_mode,
+			.blend_mode = blend_mode,
 		});
 	if (!pipe) {
 		pass->failed = true;
@@ -929,6 +973,20 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 	vkCmdPushConstants(cb, pipe->layout->vk,
 		VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(vert_pcr_data),
 		sizeof(frag_pcr_data), &frag_pcr_data);
+
+	if (use_effects) {
+		// Size/position of the rounded shape come from the CSD clip box
+		// (defaults to the dst box), matching GLES fx_render_pass_add_texture.
+		struct wlr_box corner_box = dst_box;
+		if (fx_options->clip_box != NULL && !wlr_box_empty(fx_options->clip_box)) {
+			corner_box = *fx_options->clip_box;
+		}
+		struct fx_vk_frag_corner_pcr_data corner_pcr;
+		fill_corner_pcr(&corner_pcr, &corner_box, &fx_options->corners,
+			&fx_options->clipped_region);
+		vkCmdPushConstants(cb, pipe->layout->vk, VK_SHADER_STAGE_FRAGMENT_BIT,
+			FX_VK_TEX_ROUND_CORNER_OFFSET, sizeof(corner_pcr), &corner_pcr);
+	}
 
 	pixman_region32_t clip;
 	get_clip_region(pass, options->clip, &clip);
@@ -981,11 +1039,144 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 	}
 }
 
+// Base wlr_render_pass_impl entry point: no scenefx effects.
+static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
+		const struct wlr_render_texture_options *options) {
+	render_texture(get_render_pass(wlr_pass), options, NULL);
+}
+
+// Draws a rounded, optionally interior-clipped solid rect using the rounded
+// quad pipeline. Shared by fx_vk_render_pass_add_rounded_rect and the gradient
+// entry point (which currently renders with the base colour, see below).
+static void render_rounded_rect(struct fx_vk_render_pass *pass,
+		const struct wlr_render_rect_options *options,
+		const struct fx_corner_fradii *corners,
+		const struct clipped_fregion *clipped_region) {
+	VkCommandBuffer cb = pass->command_buffer->vk;
+
+	// Same sRGB -> linear premultiplied conversion as render_pass_add_rect.
+	float linear_color[] = {
+		color_to_linear_premult(options->color.r, options->color.a),
+		color_to_linear_premult(options->color.g, options->color.a),
+		color_to_linear_premult(options->color.b, options->color.a),
+		options->color.a,
+	};
+
+	struct wlr_box box;
+	wlr_render_rect_options_get_box(options, pass->render_buffer->wlr_buffer, &box);
+
+	pixman_region32_t clip;
+	get_clip_region(pass, options->clip, &clip);
+
+	int clip_rects_len;
+	const pixman_box32_t *clip_rects = pixman_region32_rectangles(&clip, &clip_rects_len);
+	for (int i = 0; i < clip_rects_len; i++) {
+		struct wlr_box clip_box = {
+			.x = clip_rects[i].x1,
+			.y = clip_rects[i].y1,
+			.width = clip_rects[i].x2 - clip_rects[i].x1,
+			.height = clip_rects[i].y2 - clip_rects[i].y1,
+		};
+		struct wlr_box intersection;
+		if (wlr_box_intersection(&intersection, &box, &clip_box)) {
+			render_pass_mark_box_updated(pass, &intersection);
+		}
+	}
+
+	float proj[9], matrix[9];
+	wlr_matrix_identity(proj);
+	wlr_matrix_project_box(matrix, &box, WL_OUTPUT_TRANSFORM_NORMAL, proj);
+	wlr_matrix_multiply(matrix, pass->projection, matrix);
+
+	// Rounded corners always need alpha blending for partial edge coverage.
+	struct fx_vk_pipeline *pipe = setup_get_or_create_pipeline(
+		pass->render_setup,
+		&(struct fx_vk_pipeline_key) {
+			.source = WLR_VK_SHADER_SOURCE_QUAD_ROUND,
+			.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+			.layout = {0},
+		});
+	if (!pipe) {
+		pass->failed = true;
+		pixman_region32_fini(&clip);
+		return;
+	}
+
+	struct fx_vk_vert_pcr_data vert_pcr_data = {
+		.uv_off = { 0, 0 },
+		.uv_size = { 1, 1 },
+	};
+	encode_proj_matrix(matrix, vert_pcr_data.mat4);
+
+	struct fx_vk_frag_corner_pcr_data corner_pcr;
+	fill_corner_pcr(&corner_pcr, &box, corners, clipped_region);
+
+	bind_pipeline(pass, pipe->vk);
+	vkCmdPushConstants(cb, pipe->layout->vk,
+		VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vert_pcr_data), &vert_pcr_data);
+	vkCmdPushConstants(cb, pipe->layout->vk,
+		VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(vert_pcr_data),
+		sizeof(float) * 4, linear_color);
+	vkCmdPushConstants(cb, pipe->layout->vk, VK_SHADER_STAGE_FRAGMENT_BIT,
+		FX_VK_QUAD_ROUND_CORNER_OFFSET, sizeof(corner_pcr), &corner_pcr);
+
+	for (int i = 0; i < clip_rects_len; i++) {
+		VkRect2D rect;
+		convert_pixman_box_to_vk_rect(&clip_rects[i], &rect);
+		vkCmdSetScissor(cb, 0, 1, &rect);
+		vkCmdDraw(cb, 4, 1, 0, 0);
+	}
+
+	pixman_region32_fini(&clip);
+}
+
 static const struct wlr_render_pass_impl render_pass_impl = {
 	.submit = render_pass_submit,
 	.add_rect = render_pass_add_rect,
 	.add_texture = render_pass_add_texture,
 };
+
+struct fx_vk_render_pass *fx_vk_render_pass_try_get(struct wlr_render_pass *wlr_pass) {
+	if (wlr_pass->impl != &render_pass_impl) {
+		return NULL;
+	}
+	return get_render_pass(wlr_pass);
+}
+
+void fx_vk_render_pass_add_texture(struct wlr_render_pass *wlr_pass,
+		const struct fx_render_texture_options *options) {
+	render_texture(get_render_pass(wlr_pass), &options->base, options);
+}
+
+void fx_vk_render_pass_add_rounded_rect(struct wlr_render_pass *wlr_pass,
+		const struct fx_render_rounded_rect_options *options) {
+	render_rounded_rect(get_render_pass(wlr_pass), &options->base,
+		&options->corners, &options->clipped_region);
+}
+
+void fx_vk_render_pass_add_rounded_rect_grad(struct wlr_render_pass *wlr_pass,
+		const struct fx_render_rounded_rect_grad_options *options) {
+	// NOTE: gradient fills are not implemented on the Vulkan path yet (they
+	// need a variable-length colour array via a UBO/SSBO, out of scope for this
+	// step). We still honour the rounded-corner + clip geometry so gradient
+	// borders keep their shape. Fill with the gradient's FIRST stop rather than
+	// options->base.color: wlr_scene_rect_set_gradient leaves rect->color at its
+	// last solid value (e.g. the inactive border colour), so a focused/gradient
+	// border would otherwise render stale. The first stop is the primary colour
+	// (focus colour for borders), which keeps a solid focused border matching
+	// the flat pills. Replace with a real gradient shader in a later step.
+	struct wlr_render_rect_options base = options->base;
+	if (options->gradient.count > 0 && options->gradient.colors != NULL) {
+		base.color = (struct wlr_render_color){
+			.r = options->gradient.colors[0],
+			.g = options->gradient.colors[1],
+			.b = options->gradient.colors[2],
+			.a = options->gradient.colors[3],
+		};
+	}
+	render_rounded_rect(get_render_pass(wlr_pass), &base,
+		&options->corners, &options->clipped_region);
+}
 
 
 void vk_color_transform_destroy(struct wlr_addon *addon) {

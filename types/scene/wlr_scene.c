@@ -2062,9 +2062,16 @@ static void scene_pass_add_texture(struct wlr_render_pass *pass,
 	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
 	if (fx != NULL) {
 		fx_render_pass_add_texture(fx, options);
-	} else {
-		wlr_render_pass_add_texture(pass, &options->base);
+		return;
 	}
+#ifdef FX_HAS_VULKAN
+	if (fx_vk_render_pass_try_get(pass) != NULL) {
+		// Vulkan: honours corners + interior clip cutout.
+		fx_vk_render_pass_add_texture(pass, options);
+		return;
+	}
+#endif
+	wlr_render_pass_add_texture(pass, &options->base);
 }
 
 static void scene_pass_add_rect(struct wlr_render_pass *pass,
@@ -2082,9 +2089,15 @@ static void scene_pass_add_rounded_rect(struct wlr_render_pass *pass,
 	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
 	if (fx != NULL) {
 		fx_render_pass_add_rounded_rect(fx, options);
-	} else {
-		wlr_render_pass_add_rect(pass, &options->base);
+		return;
 	}
+#ifdef FX_HAS_VULKAN
+	if (fx_vk_render_pass_try_get(pass) != NULL) {
+		fx_vk_render_pass_add_rounded_rect(pass, options);
+		return;
+	}
+#endif
+	wlr_render_pass_add_rect(pass, &options->base);
 }
 
 static void scene_pass_add_rounded_rect_grad(struct wlr_render_pass *pass,
@@ -2092,9 +2105,17 @@ static void scene_pass_add_rounded_rect_grad(struct wlr_render_pass *pass,
 	struct fx_gles_render_pass *fx = fx_render_pass_try_get(pass);
 	if (fx != NULL) {
 		fx_render_pass_add_rounded_rect_grad(fx, options);
-	} else {
-		wlr_render_pass_add_rect(pass, &options->base);
+		return;
 	}
+#ifdef FX_HAS_VULKAN
+	if (fx_vk_render_pass_try_get(pass) != NULL) {
+		// Vulkan: gradient fill not yet implemented; renders the rounded +
+		// clipped shape with the base colour (see fx_vk_render_pass_*).
+		fx_vk_render_pass_add_rounded_rect_grad(pass, options);
+		return;
+	}
+#endif
+	wlr_render_pass_add_rect(pass, &options->base);
 }
 
 static void scene_pass_add_box_shadow(struct wlr_render_pass *pass,

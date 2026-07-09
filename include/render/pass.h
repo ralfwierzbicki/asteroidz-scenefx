@@ -24,4 +24,26 @@ struct fx_gles_render_pass *fx_begin_buffer_pass(struct fx_framebuffer *buffer,
  */
 struct fx_gles_render_pass *fx_render_pass_try_get(struct wlr_render_pass *pass);
 
+#ifdef FX_HAS_VULKAN
+/**
+ * Returns the scenefx Vulkan (fx_vk) render pass backing `pass`, or NULL if
+ * `pass` is not an fx_vk pass. Analogous to fx_render_pass_try_get(); lets the
+ * scene route rounded-corner effects to the Vulkan implementations below.
+ */
+struct fx_vk_render_pass *fx_vk_render_pass_try_get(struct wlr_render_pass *pass);
+
+/**
+ * Vulkan (fx_vk) implementations of scenefx's rounded-corner effect entry
+ * points. They mirror the GLES fx_render_pass_add_* functions but operate on an
+ * fx_vk pass. Only rounded rects, rounded textures and interior clip cutouts
+ * are implemented in this step; gradients/shadows/blur remain no-ops.
+ */
+void fx_vk_render_pass_add_rounded_rect(struct wlr_render_pass *pass,
+	const struct fx_render_rounded_rect_options *options);
+void fx_vk_render_pass_add_rounded_rect_grad(struct wlr_render_pass *pass,
+	const struct fx_render_rounded_rect_grad_options *options);
+void fx_vk_render_pass_add_texture(struct wlr_render_pass *pass,
+	const struct fx_render_texture_options *options);
+#endif
+
 #endif

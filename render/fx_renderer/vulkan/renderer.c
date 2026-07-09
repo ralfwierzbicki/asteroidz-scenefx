@@ -26,6 +26,8 @@
 #include "texture.frag.h"
 #include "quad.frag.h"
 #include "output.frag.h"
+#include "quad_round.frag.h"
+#include "texture_round.frag.h"
 #include "types/wlr_buffer.h"
 #include "util/time.h"
 
@@ -1181,6 +1183,8 @@ static void fx_vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 	vkDestroyShaderModule(dev->dev, renderer->tex_frag_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->quad_frag_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->output_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->quad_round_frag_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->tex_round_frag_module, NULL);
 
 	struct fx_vk_pipeline_layout *pipeline_layout, *pipeline_layout_tmp;
 	wl_list_for_each_safe(pipeline_layout, pipeline_layout_tmp,
@@ -1522,14 +1526,23 @@ static bool init_tex_layouts(struct fx_vk_renderer *renderer,
 		return false;
 	}
 
+	// The fragment push-constant range must be large enough for the biggest
+	// consumer of this shared layout. The rounded-texture shader (fx_vk fork)
+	// reads the base texture data (offset 80, 72 bytes) plus the corner block
+	// pushed at offset 160 (fx_vk_frag_corner_pcr_data, 64 bytes), i.e. it
+	// extends to offset 224. The rounded-quad shader stays within that (corner
+	// at 96, extends to 160). See fx_vk_frag_corner_pcr_data for why push
+	// constants are used and the maxPushConstantsSize budget (target: 256).
+	const uint32_t vert_pcr_size = sizeof(struct fx_vk_vert_pcr_data); // 80
+	const uint32_t frag_corner_end = 160 + sizeof(struct fx_vk_frag_corner_pcr_data); // 224
 	VkPushConstantRange pc_ranges[] = {
 		{
-			.size = sizeof(struct fx_vk_vert_pcr_data),
+			.size = vert_pcr_size,
 			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
 		},
 		{
-			.offset = pc_ranges[0].size,
-			.size = sizeof(struct fx_vk_frag_texture_pcr_data),
+			.offset = vert_pcr_size,
+			.size = frag_corner_end - vert_pcr_size,
 			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 	};
@@ -1684,7 +1697,8 @@ static bool pipeline_key_equals(const struct fx_vk_pipeline_key *a,
 		return false;
 	}
 
-	if (a->source == WLR_VK_SHADER_SOURCE_TEXTURE &&
+	if ((a->source == WLR_VK_SHADER_SOURCE_TEXTURE ||
+				a->source == WLR_VK_SHADER_SOURCE_TEXTURE_ROUND) &&
 			a->texture_transform != b->texture_transform) {
 		return false;
 	}
@@ -1761,6 +1775,24 @@ struct fx_vk_pipeline *setup_get_or_create_pipeline(
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
 			.module = renderer->tex_frag_module,
+			.pName = "main",
+			.pSpecializationInfo = &specialization,
+		};
+		break;
+	// scenefx effect sources (fx_vk fork)
+	case WLR_VK_SHADER_SOURCE_QUAD_ROUND:
+		stages[1] = (VkPipelineShaderStageCreateInfo) {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.module = renderer->quad_round_frag_module,
+			.pName = "main",
+		};
+		break;
+	case WLR_VK_SHADER_SOURCE_TEXTURE_ROUND:
+		stages[1] = (VkPipelineShaderStageCreateInfo) {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.module = renderer->tex_round_frag_module,
 			.pName = "main",
 			.pSpecializationInfo = &specialization,
 		};
@@ -2244,6 +2276,29 @@ static bool init_static_render_data(struct fx_vk_renderer *renderer) {
 		return false;
 	}
 
+	// scenefx effect fragment shaders (fx_vk fork): rounded rect + rounded texture
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(quad_round_frag_data),
+		.pCode = quad_round_frag_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->quad_round_frag_module);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create rounded quad fragment shader module", res);
+		return false;
+	}
+
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(texture_round_frag_data),
+		.pCode = texture_round_frag_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->tex_round_frag_module);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create rounded tex fragment shader module", res);
+		return false;
+	}
+
 	return true;
 }
 
@@ -2528,6 +2583,22 @@ struct wlr_renderer *fx_vulkan_renderer_create_for_device(struct fx_vk_device *d
 	}
 
 	renderer->dev = dev;
+
+	// scenefx (fx_vk fork): the rounded-rect / rounded-texture effect
+	// pipelines deliver per-draw corner data via push constants. Log the
+	// device budget so we can tell at a glance whether the worst case
+	// (rounded texture, 224 bytes) fits. See fx_vk_frag_corner_pcr_data.
+	VkPhysicalDeviceProperties phdev_props;
+	vkGetPhysicalDeviceProperties(dev->phdev, &phdev_props);
+	unsigned max_pcr = phdev_props.limits.maxPushConstantsSize;
+	wlr_log(WLR_INFO, "fx_vk: maxPushConstantsSize = %u bytes "
+		"(rounded-rect effects need up to 224)", max_pcr);
+	if (max_pcr < 160 + sizeof(struct fx_vk_frag_corner_pcr_data)) {
+		wlr_log(WLR_ERROR, "fx_vk: maxPushConstantsSize (%u) is below the "
+			"224 bytes needed for rounded textures; those effects will fail to "
+			"build pipelines and degrade to no-ops on this device", max_pcr);
+	}
+
 	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
 	renderer->wlr_renderer.features.input_color_transform = true;
 	renderer->wlr_renderer.features.output_color_transform = true;
