@@ -216,7 +216,14 @@ struct fx_vk_render_format_setup {
 	const struct fx_vk_format *render_format; // used in renderpass
 	bool use_blending_buffer;
 	bool use_srgb;
+	// Scene render pass (draws the window/effect geometry). For the two-pass
+	// (blending) path this draws into the sampled 16F scene image; the separate
+	// output_render_pass below samples that image and applies the colour
+	// transform. For the one-pass paths only render_pass is used.
 	VkRenderPass render_pass;
+	// Two-pass path only: standalone output render pass that samples the scene
+	// image and writes the final output image.
+	VkRenderPass output_render_pass;
 
 	VkPipeline output_pipe_identity;
 	VkPipeline output_pipe_srgb;
@@ -316,7 +323,9 @@ struct fx_vk_render_buffer {
 		VkDeviceMemory blend_memory;
 		VkDescriptorSet blend_descriptor_set;
 		struct fx_vk_descriptor_pool *blend_attachment_pool;
-		bool blend_transitioned;
+		// Framebuffer for the scene render pass (single attachment: the scene
+		// image). out.framebuffer is reused for the output render pass.
+		VkFramebuffer scene_framebuffer;
 	} two_pass;
 };
 
@@ -390,6 +399,9 @@ struct fx_vk_renderer {
 	VkDescriptorSetLayout output_ds_srgb_layout;
 	VkDescriptorSetLayout output_ds_lut3d_layout;
 	VkSampler output_sampler_lut3d;
+	// Immutable sampler baked into output_ds_srgb_layout: the output pass now
+	// samples the scene image via a sampler2D (was an input attachment).
+	VkSampler output_sampler;
 	// descriptor set indicating dummy 1x1x1 image, for use in the lut3d slot
 	VkDescriptorSet output_ds_lut3d_dummy;
 	struct fx_vk_descriptor_pool *output_ds_lut3d_dummy_pool;

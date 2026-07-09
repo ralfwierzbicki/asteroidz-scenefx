@@ -1,6 +1,6 @@
 #version 450
 
-layout (input_attachment_index = 0, set = 0, binding = 0) uniform subpassInput in_color;
+layout(set = 0, binding = 0) uniform sampler2D scene_tex;
 
 layout(set = 1, binding = 0) uniform sampler3D lut_3d;
 
@@ -59,7 +59,10 @@ vec3 linear_color_to_bt1886(vec3 color) {
 }
 
 void main() {
-	vec4 in_color = subpassLoad(in_color).rgba;
+	// Sample the exact texel matching this fragment (1:1 with the old
+	// subpassLoad): read at gl_FragCoord / texture size, orientation-safe.
+	vec2 scene_uv = gl_FragCoord.xy / vec2(textureSize(scene_tex, 0));
+	vec4 in_color = texture(scene_tex, scene_uv);
 
 	// Convert from pre-multiplied alpha to straight alpha
 	float alpha = in_color.a;

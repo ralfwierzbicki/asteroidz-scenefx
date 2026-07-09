@@ -158,7 +158,7 @@ struct fx_vk_descriptor_pool *fx_vulkan_alloc_texture_ds(
 
 struct fx_vk_descriptor_pool *fx_vulkan_alloc_blend_ds(
 	struct fx_vk_renderer *renderer, VkDescriptorSet *ds) {
-	return alloc_ds(renderer, ds, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+	return alloc_ds(renderer, ds, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 		&renderer->output_ds_srgb_layout, &renderer->output_descriptor_pools,
 		&renderer->last_output_pool_size);
 }
@@ -177,6 +177,7 @@ static void destroy_render_format_setup(struct fx_vk_renderer *renderer,
 
 	VkDevice dev = renderer->dev->dev;
 	vkDestroyRenderPass(dev, setup->render_pass, NULL);
+	vkDestroyRenderPass(dev, setup->output_render_pass, NULL);
 	vkDestroyPipeline(dev, setup->output_pipe_identity, NULL);
 	vkDestroyPipeline(dev, setup->output_pipe_srgb, NULL);
 	vkDestroyPipeline(dev, setup->output_pipe_pq, NULL);
@@ -635,6 +636,7 @@ static void destroy_render_buffer(struct fx_vk_render_buffer *buffer) {
 	finish_render_buffer_out(&buffer->srgb.out, dev);
 
 	finish_render_buffer_out(&buffer->two_pass.out, dev);
+	vkDestroyFramebuffer(dev, buffer->two_pass.scene_framebuffer, NULL);
 	vkDestroyImage(dev, buffer->two_pass.blend_image, NULL);
 	vkFreeMemory(dev, buffer->two_pass.blend_memory, NULL);
 	vkDestroyImageView(dev, buffer->two_pass.blend_image_view, NULL);
@@ -714,7 +716,9 @@ bool fx_vulkan_setup_two_pass_framebuffer(struct fx_vk_render_buffer *buffer,
 		.tiling = VK_IMAGE_TILING_OPTIMAL,
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 		.extent = (VkExtent3D) { dmabuf->width, dmabuf->height, 1 },
-		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+		// The scene image is both a colour attachment (the scene pass draws
+		// into it) and sampled (the output pass reads it via a sampler2D).
+		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 	};
 
 	res = vkCreateImage(dev, &img_info, NULL, &buffer->two_pass.blend_image);
@@ -782,37 +786,65 @@ bool fx_vulkan_setup_two_pass_framebuffer(struct fx_vk_render_buffer *buffer,
 		goto error;
 	}
 
+	// The scene image is sampled (COMBINED_IMAGE_SAMPLER) by the output pass.
+	// It lives in GENERAL for its whole life; the immutable sampler is baked
+	// into output_ds_srgb_layout so .sampler here is VK_NULL_HANDLE.
 	VkDescriptorImageInfo ds_attach_info = {
-		.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
 		.imageView = buffer->two_pass.blend_image_view,
 		.sampler = VK_NULL_HANDLE,
 	};
 	VkWriteDescriptorSet ds_write = {
 		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
 		.descriptorCount = 1,
-		.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 		.dstSet = buffer->two_pass.blend_descriptor_set,
 		.dstBinding = 0,
 		.pImageInfo = &ds_attach_info,
 	};
 	vkUpdateDescriptorSets(dev, 1, &ds_write, 0, NULL);
 
-	VkImageView attachments[] = {
-		buffer->two_pass.blend_image_view,
-		buffer->two_pass.out.image_view,
-	};
-	VkFramebufferCreateInfo fb_info = {
+	// Move the scene image UNDEFINED -> GENERAL once, up front (mirrors
+	// fx_vk_effect_image_create). It stays GENERAL for its whole life, so the
+	// scene pass can be ended/re-begun and sampled with no layout transitions.
+	VkCommandBuffer stage_cb = fx_vulkan_record_stage_cb(renderer);
+	fx_vulkan_change_layout(stage_cb, buffer->two_pass.blend_image,
+		VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+		VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+
+	// Scene framebuffer: the scene pass draws into the scene image.
+	VkFramebufferCreateInfo scene_fb_info = {
 		.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-		.attachmentCount = sizeof(attachments) / sizeof(attachments[0]),
-		.pAttachments = attachments,
+		.attachmentCount = 1,
+		.pAttachments = &buffer->two_pass.blend_image_view,
 		.flags = 0u,
 		.width = dmabuf->width,
 		.height = dmabuf->height,
 		.layers = 1u,
 		.renderPass = buffer->two_pass.render_setup->render_pass,
 	};
+	res = vkCreateFramebuffer(dev, &scene_fb_info, NULL,
+		&buffer->two_pass.scene_framebuffer);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("vkCreateFramebuffer", res);
+		goto error;
+	}
 
-	res = vkCreateFramebuffer(dev, &fb_info, NULL, &buffer->two_pass.out.framebuffer);
+	// Output framebuffer: the output pass samples the scene image and writes
+	// the final output image.
+	VkFramebufferCreateInfo out_fb_info = {
+		.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		.attachmentCount = 1,
+		.pAttachments = &buffer->two_pass.out.image_view,
+		.flags = 0u,
+		.width = dmabuf->width,
+		.height = dmabuf->height,
+		.layers = 1u,
+		.renderPass = buffer->two_pass.render_setup->output_render_pass,
+	};
+	res = vkCreateFramebuffer(dev, &out_fb_info, NULL,
+		&buffer->two_pass.out.framebuffer);
 	if (res != VK_SUCCESS) {
 		fx_vk_error("vkCreateFramebuffer", res);
 		goto error;
@@ -1459,6 +1491,7 @@ static void fx_vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 	vkDestroyDescriptorSetLayout(dev->dev, renderer->output_ds_lut3d_layout, NULL);
 	vkDestroyCommandPool(dev->dev, renderer->command_pool, NULL);
 	vkDestroySampler(dev->dev, renderer->output_sampler_lut3d, NULL);
+	vkDestroySampler(dev->dev, renderer->output_sampler, NULL);
 
 	if (renderer->read_pixels_cache.initialized) {
 		vkFreeMemory(dev->dev, renderer->read_pixels_cache.dst_img_memory, NULL);
@@ -1821,12 +1854,33 @@ static bool init_blend_to_output_layouts(struct fx_vk_renderer *renderer) {
 	VkResult res;
 	VkDevice dev = renderer->dev->dev;
 
+	// Sampler for reading the scene image in the output pass. NEAREST filter +
+	// CLAMP_TO_EDGE so sampling at gl_FragCoord/size reads the exact texel,
+	// matching the old input-attachment subpassLoad 1:1.
+	VkSamplerCreateInfo scene_sampler_info = {
+		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+		.magFilter = VK_FILTER_NEAREST,
+		.minFilter = VK_FILTER_NEAREST,
+		.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+		.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.minLod = 0.f,
+		.maxLod = 0.25f,
+	};
+	res = vkCreateSampler(dev, &scene_sampler_info, NULL,
+		&renderer->output_sampler);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("vkCreateSampler", res);
+		return false;
+	}
+
 	VkDescriptorSetLayoutBinding ds_binding_input = {
 		.binding = 0,
-		.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 		.descriptorCount = 1,
 		.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-		.pImmutableSamplers = NULL,
+		.pImmutableSamplers = &renderer->output_sampler,
 	};
 
 	VkDescriptorSetLayoutCreateInfo ds_info = {
@@ -2266,7 +2320,7 @@ static bool init_blend_to_output_pipeline(struct fx_vk_renderer *renderer,
 		.pNext = NULL,
 		.layout = pipe_layout,
 		.renderPass = rp,
-		.subpass = 1, // second subpass!
+		.subpass = 0, // standalone output render pass
 		.stageCount = sizeof(tex_stages) / sizeof(tex_stages[0]),
 		.pStages = tex_stages,
 		.pInputAssemblyState = &assembly,
@@ -2659,60 +2713,115 @@ static struct fx_vk_render_format_setup *find_or_create_render_setup(
 	VkResult res;
 
 	if (use_blending_buffer) {
-		VkAttachmentDescription attachments[] = {
-			{
-				.format = VK_FORMAT_R16G16B16A16_SFLOAT,
-				.samples = VK_SAMPLE_COUNT_1_BIT,
-				.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-			},
-			{
-				.format = format->vk,
-				.samples = VK_SAMPLE_COUNT_1_BIT,
-				.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				.initialLayout = VK_IMAGE_LAYOUT_GENERAL,
-				.finalLayout = VK_IMAGE_LAYOUT_GENERAL,
-			}
+		// SCENE render pass: a standalone single-subpass pass that draws the
+		// window/effect geometry into the sampled 16F scene image. The image
+		// lives in GENERAL for its whole life (init/final GENERAL), so this
+		// pass can be ended and re-begun freely, and the separate output pass
+		// can sample it. Its subpass dependencies guard the colour-write ->
+		// shader-read hazard against the surrounding (EXTERNAL) work.
+		VkAttachmentDescription scene_attachment = {
+			.format = VK_FORMAT_R16G16B16A16_SFLOAT,
+			.samples = VK_SAMPLE_COUNT_1_BIT,
+			.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+			.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.finalLayout = VK_IMAGE_LAYOUT_GENERAL,
 		};
 
-		VkAttachmentReference blend_write_ref = {
+		VkAttachmentReference scene_color_ref = {
+			.attachment = 0u,
+			.layout = VK_IMAGE_LAYOUT_GENERAL,
+		};
+
+		VkSubpassDescription scene_subpass = {
+			.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+			.colorAttachmentCount = 1,
+			.pColorAttachments = &scene_color_ref,
+		};
+
+		VkSubpassDependency scene_deps[] = {
+			{
+				.srcSubpass = VK_SUBPASS_EXTERNAL,
+				.srcStageMask = VK_PIPELINE_STAGE_HOST_BIT |
+					VK_PIPELINE_STAGE_TRANSFER_BIT |
+					VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
+					VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+					VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT |
+					VK_ACCESS_TRANSFER_WRITE_BIT |
+					VK_ACCESS_SHADER_READ_BIT |
+					VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				.dstSubpass = 0,
+				.dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+				.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT |
+					VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+					VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
+					VK_ACCESS_SHADER_READ_BIT |
+					VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			},
+			{
+				.srcSubpass = 0,
+				.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				.dstSubpass = VK_SUBPASS_EXTERNAL,
+				.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+					VK_PIPELINE_STAGE_TRANSFER_BIT |
+					VK_PIPELINE_STAGE_HOST_BIT |
+					VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+				.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+					VK_ACCESS_TRANSFER_READ_BIT |
+					VK_ACCESS_MEMORY_READ_BIT,
+			},
+		};
+
+		VkRenderPassCreateInfo scene_rp_info = {
+			.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+			.attachmentCount = 1,
+			.pAttachments = &scene_attachment,
+			.subpassCount = 1,
+			.pSubpasses = &scene_subpass,
+			.dependencyCount = sizeof(scene_deps) / sizeof(scene_deps[0]),
+			.pDependencies = scene_deps,
+		};
+
+		res = vkCreateRenderPass(dev, &scene_rp_info, NULL, &setup->render_pass);
+		if (res != VK_SUCCESS) {
+			fx_vk_error("Failed to create scene render pass", res);
+			goto error;
+		}
+
+		// OUTPUT render pass: standalone single-subpass pass that samples the
+		// scene image and writes the final output image with the colour
+		// transform. Mirrors the non-blending branch's attachment + deps.
+		VkAttachmentDescription out_attachment = {
+			.format = format->vk,
+			.samples = VK_SAMPLE_COUNT_1_BIT,
+			.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+			.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.finalLayout = VK_IMAGE_LAYOUT_GENERAL,
+		};
+		if (srgb) {
+			assert(format->vk_srgb);
+			out_attachment.format = format->vk_srgb;
+		}
+
+		VkAttachmentReference out_color_ref = {
 			.attachment = 0u,
 			.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
 
-		VkAttachmentReference blend_read_ref = {
-			.attachment = 0u,
-			.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VkSubpassDescription out_subpass = {
+			.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+			.colorAttachmentCount = 1,
+			.pColorAttachments = &out_color_ref,
 		};
 
-		VkAttachmentReference color_ref = {
-			.attachment = 1u,
-			.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		};
-
-		VkSubpassDescription subpasses[] = {
-			{
-				.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-				.colorAttachmentCount = 1,
-				.pColorAttachments = &blend_write_ref,
-			},
-			{
-				.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-				.inputAttachmentCount = 1,
-				.pInputAttachments = &blend_read_ref,
-				.colorAttachmentCount = 1,
-				.pColorAttachments = &color_ref,
-			}
-		};
-
-		VkSubpassDependency deps[] = {
+		VkSubpassDependency out_deps[] = {
 			{
 				.srcSubpass = VK_SUBPASS_EXTERNAL,
 				.srcStageMask = VK_PIPELINE_STAGE_HOST_BIT |
@@ -2733,15 +2842,6 @@ static struct fx_vk_render_format_setup *find_or_create_render_setup(
 				.srcSubpass = 0,
 				.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				.dstSubpass = 1,
-				.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-				.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
-			},
-			{
-				.srcSubpass = 1,
-				.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 				.dstSubpass = VK_SUBPASS_EXTERNAL,
 				.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT |
 					VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -2750,52 +2850,51 @@ static struct fx_vk_render_format_setup *find_or_create_render_setup(
 			},
 		};
 
-		VkRenderPassCreateInfo rp_info = {
+		VkRenderPassCreateInfo out_rp_info = {
 			.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-			.pNext = NULL,
-			.flags = 0,
-			.attachmentCount = sizeof(attachments) / sizeof(attachments[0]),
-			.pAttachments = attachments,
-			.subpassCount = sizeof(subpasses) / sizeof(subpasses[0]),
-			.pSubpasses = subpasses,
-			.dependencyCount = sizeof(deps) / sizeof(deps[0]),
-			.pDependencies = deps,
+			.attachmentCount = 1,
+			.pAttachments = &out_attachment,
+			.subpassCount = 1,
+			.pSubpasses = &out_subpass,
+			.dependencyCount = sizeof(out_deps) / sizeof(out_deps[0]),
+			.pDependencies = out_deps,
 		};
 
-		res = vkCreateRenderPass(dev, &rp_info, NULL, &setup->render_pass);
+		res = vkCreateRenderPass(dev, &out_rp_info, NULL,
+			&setup->output_render_pass);
 		if (res != VK_SUCCESS) {
-			fx_vk_error("Failed to create 2-step render pass", res);
+			fx_vk_error("Failed to create output render pass", res);
 			goto error;
 		}
 
-		// this is only well defined if render pass has a 2nd subpass
+		// Output pipelines target the standalone output pass (subpass 0).
 		if (!init_blend_to_output_pipeline(
-				renderer, setup->render_pass, renderer->output_pipe_layout,
+				renderer, setup->output_render_pass, renderer->output_pipe_layout,
 				&setup->output_pipe_identity, WLR_VK_OUTPUT_TRANSFORM_IDENTITY)) {
 			goto error;
 		}
 		if (!init_blend_to_output_pipeline(
-				renderer, setup->render_pass, renderer->output_pipe_layout,
+				renderer, setup->output_render_pass, renderer->output_pipe_layout,
 				&setup->output_pipe_lut3d, WLR_VK_OUTPUT_TRANSFORM_LUT3D)) {
 			goto error;
 		}
 		if (!init_blend_to_output_pipeline(
-				renderer, setup->render_pass, renderer->output_pipe_layout,
+				renderer, setup->output_render_pass, renderer->output_pipe_layout,
 				&setup->output_pipe_srgb, WLR_VK_OUTPUT_TRANSFORM_INVERSE_SRGB)) {
 			goto error;
 		}
 		if (!init_blend_to_output_pipeline(
-				renderer, setup->render_pass, renderer->output_pipe_layout,
+				renderer, setup->output_render_pass, renderer->output_pipe_layout,
 				&setup->output_pipe_pq, WLR_VK_OUTPUT_TRANSFORM_INVERSE_ST2084_PQ)) {
 			goto error;
 		}
 		if (!init_blend_to_output_pipeline(
-				renderer, setup->render_pass, renderer->output_pipe_layout,
+				renderer, setup->output_render_pass, renderer->output_pipe_layout,
 				&setup->output_pipe_gamma22, WLR_VK_OUTPUT_TRANSFORM_INVERSE_GAMMA22)) {
 			goto error;
 		}
 		if (!init_blend_to_output_pipeline(
-			renderer, setup->render_pass, renderer->output_pipe_layout,
+			renderer, setup->output_render_pass, renderer->output_pipe_layout,
 			&setup->output_pipe_bt1886, WLR_VK_OUTPUT_TRANSFORM_INVERSE_BT1886)) {
 			goto error;
 		}

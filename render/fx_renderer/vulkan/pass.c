@@ -252,11 +252,30 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 	renderer->stage.cb = NULL;
 
 	if (pass->two_pass) {
-		// Apply output shader to map blend image to actual output image
-		vkCmdNextSubpass(render_cb->vk, VK_SUBPASS_CONTENTS_INLINE);
-
 		int width = pass->render_buffer->wlr_buffer->width;
 		int height = pass->render_buffer->wlr_buffer->height;
+
+		// End the SCENE pass: the scene image is now fully written and (being
+		// GENERAL) readable. Then begin the standalone OUTPUT pass, which
+		// samples the scene image and applies the colour transform.
+		vkCmdEndRenderPass(render_cb->vk);
+
+		VkRect2D full_rect = { .extent = { width, height } };
+		VkRenderPassBeginInfo out_rp_info = {
+			.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+			.renderArea = full_rect,
+			.clearValueCount = 0,
+			.renderPass = render_buffer->two_pass.render_setup->output_render_pass,
+			.framebuffer = render_buffer->two_pass.out.framebuffer,
+		};
+		vkCmdBeginRenderPass(render_cb->vk, &out_rp_info,
+			VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdSetViewport(render_cb->vk, 0, 1, &(VkViewport){
+			.width = width,
+			.height = height,
+			.maxDepth = 1,
+		});
+		vkCmdSetScissor(render_cb->vk, 0, 1, &full_rect);
 
 		float final_matrix[9] = {
 			width, 0, -1,
@@ -468,35 +487,8 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		pass->render_buffer_out->transitioned = true;
 	}
 
-	if (pass->two_pass) {
-		// The render pass changes the blend image layout from
-		// color attachment to read only, so on each frame, before
-		// the render pass starts, we change it back
-		VkImageLayout blend_src_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		if (!render_buffer->two_pass.blend_transitioned) {
-			blend_src_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-			render_buffer->two_pass.blend_transitioned = true;
-		}
-
-		VkImageMemoryBarrier blend_acq_barrier = {
-			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.image = render_buffer->two_pass.blend_image,
-			.oldLayout = blend_src_layout,
-			.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			.srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			.subresourceRange = {
-				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-				.layerCount = 1,
-				.levelCount = 1,
-			},
-		};
-		vkCmdPipelineBarrier(stage_cb->vk, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			0, 0, NULL, 0, NULL, 1, &blend_acq_barrier);
-	}
+	// The scene image stays in VK_IMAGE_LAYOUT_GENERAL for its whole life
+	// (transitioned once at creation), so no per-frame layout flip is needed.
 
 	// acquire render buffer before rendering
 	acquire_barriers[idx] = (VkImageMemoryBarrier){
@@ -1746,12 +1738,20 @@ struct fx_vk_render_pass *fx_vulkan_begin_render_pass(struct fx_vk_renderer *ren
 	int height = buffer->wlr_buffer->height;
 	VkRect2D rect = { .extent = { width, height } };
 
+	// For the two-pass path, render_setup->render_pass is the SCENE pass and we
+	// draw into the dedicated scene framebuffer (the output framebuffer is used
+	// later, in render_pass_submit, for the separate output pass).
+	VkFramebuffer begin_framebuffer = buffer_out->framebuffer;
+	if (using_two_pass_pathway) {
+		begin_framebuffer = buffer->two_pass.scene_framebuffer;
+	}
+
 	VkRenderPassBeginInfo rp_info = {
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 		.renderArea = rect,
 		.clearValueCount = 0,
 		.renderPass = render_setup->render_pass,
-		.framebuffer = buffer_out->framebuffer,
+		.framebuffer = begin_framebuffer,
 	};
 	vkCmdBeginRenderPass(cb->vk, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
 
