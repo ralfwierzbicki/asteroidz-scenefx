@@ -335,6 +335,15 @@ struct fx_vk_effect_buffers *fx_vk_effect_buffers_get(
 	int width, int height);
 void fx_vk_effect_buffers_destroy(struct fx_vk_effect_buffers *bufs);
 
+// Dual-Kawase blur of `source` into the ping-pong effect buffers; returns the
+// effect image holding the blurred result. Must be called with no render pass
+// active (it drives its own render passes between main-pass segments).
+struct blur_data;
+struct fx_vk_render_pass; // defined below
+struct fx_vk_effect_image *fx_vk_render_pass_blur(struct fx_vk_render_pass *pass,
+	struct fx_vk_effect_buffers *bufs, struct fx_vk_effect_image *source,
+	const struct blur_data *blur_data);
+
 struct fx_vk_command_buffer {
 	VkCommandBuffer vk;
 	bool recording;

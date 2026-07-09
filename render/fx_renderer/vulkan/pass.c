@@ -10,6 +10,7 @@
 #include "render/pass.h"
 #include "render/vulkan.h"
 #include "util/matrix.h"
+#include "scenefx/types/fx/blur_data.h"
 
 // Corner-block push-constant offsets. Must match the `layout(offset = ...)`
 // declarations in shaders/quad_round.frag and shaders/texture_round.frag.
@@ -1274,6 +1275,133 @@ static void render_box_shadow(struct fx_vk_render_pass *pass,
 void fx_vk_render_pass_add_box_shadow(struct wlr_render_pass *wlr_pass,
 		const struct fx_render_box_shadow_options *options) {
 	render_box_shadow(get_render_pass(wlr_pass), options);
+}
+
+// ---- dual-Kawase blur orchestration (fx_vk fork) ----------------------------
+
+// blur1/blur2/blur_effects fragment push block (offset 80, see the shaders).
+struct fx_vk_blur_pcr {
+	float halfpixel[2];
+	float radius;
+};
+
+// One Kawase iteration: begins its OWN render pass into dst, samples src, ends.
+// MUST be called with no render pass active (the blur runs between main-pass
+// segments). Effect images stay in GENERAL layout, so the effect render pass's
+// subpass dependencies handle the previous-pass colour-write -> shader-read
+// hazard. Draws a full-buffer quad but scissors to `scissor` (the scaled damage
+// rect that, with the shader's uv*2 / uv/2, performs the down/upsample).
+static void render_effect_blur_pass(struct fx_vk_render_pass *pass,
+		struct fx_vk_effect_image *src, struct fx_vk_effect_image *dst,
+		enum fx_vk_shader_source shader_source,
+		const void *frag_pcr, size_t frag_pcr_size, VkRect2D scissor) {
+	VkCommandBuffer cb = pass->command_buffer->vk;
+
+	struct fx_vk_pipeline *pipe = setup_get_or_create_pipeline(
+		dst->render_setup,
+		&(struct fx_vk_pipeline_key){
+			.source = shader_source,
+			.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+			.layout = { .filter_mode = WLR_SCALE_FILTER_BILINEAR },
+		});
+	if (!pipe) {
+		pass->failed = true;
+		return;
+	}
+
+	// Full-buffer quad; effect buffers are output-sized so pass->projection
+	// applies. uv = pos (uv_off 0 / uv_size 1).
+	struct wlr_box full = { 0, 0, dst->width, dst->height };
+	float proj[9], matrix[9];
+	wlr_matrix_identity(proj);
+	wlr_matrix_project_box(matrix, &full, WL_OUTPUT_TRANSFORM_NORMAL, proj);
+	wlr_matrix_multiply(matrix, pass->projection, matrix);
+
+	struct fx_vk_vert_pcr_data vert = { .uv_off = { 0, 0 }, .uv_size = { 1, 1 } };
+	encode_proj_matrix(matrix, vert.mat4);
+
+	VkRenderPassBeginInfo rp = {
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		.renderPass = dst->render_setup->render_pass,
+		.framebuffer = dst->framebuffer,
+		.renderArea = { .extent = { dst->width, dst->height } },
+		.clearValueCount = 0,
+	};
+	vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdSetViewport(cb, 0, 1, &(VkViewport){
+		.width = dst->width, .height = dst->height, .maxDepth = 1 });
+	vkCmdSetScissor(cb, 0, 1, &scissor);
+
+	vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->vk);
+	vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		pipe->layout->vk, 0, 1, &src->ds, 0, NULL);
+	vkCmdPushConstants(cb, pipe->layout->vk, VK_SHADER_STAGE_VERTEX_BIT,
+		0, sizeof(vert), &vert);
+	vkCmdPushConstants(cb, pipe->layout->vk, VK_SHADER_STAGE_FRAGMENT_BIT,
+		sizeof(vert), frag_pcr_size, frag_pcr);
+	vkCmdDraw(cb, 4, 1, 0, 0);
+	vkCmdEndRenderPass(cb);
+
+	// We drove our own render pass, so invalidate the pipeline-bind cache and
+	// (defensively) the descriptor cache for the caller's next pass.
+	pass->bound_pipeline = VK_NULL_HANDLE;
+}
+
+// Blurs `source` (an effect image holding the content to blur) with the
+// dual-Kawase down/upsample and returns the effect image holding the result
+// (one of bufs->effects / bufs->effects_swapped). Mirrors the GLES
+// get_main_buffer_blur down/up loop: dst/src boxes are always the full buffer;
+// only the scissor scales (>>(i+1) down, >>i up) while halfpixel is constant.
+struct fx_vk_effect_image *fx_vk_render_pass_blur(struct fx_vk_render_pass *pass,
+		struct fx_vk_effect_buffers *bufs, struct fx_vk_effect_image *source,
+		const struct blur_data *blur_data) {
+	int w = bufs->width, h = bufs->height;
+	if (w <= 0 || h <= 0 || blur_data->num_passes <= 0) {
+		return source;
+	}
+
+	// halfpixel = 0.5 / (size/2) downsample, 0.5 / (size*2) upsample; constant
+	// across passes (the source is always the full-size buffer).
+	struct fx_vk_blur_pcr down = { { 1.0f / w, 1.0f / h }, blur_data->radius };
+	struct fx_vk_blur_pcr up = { { 0.25f / w, 0.25f / h }, blur_data->radius };
+
+	struct fx_vk_effect_image *cur = source;
+	int n = blur_data->num_passes;
+
+	for (int i = 0; i < n; i++) {
+		struct fx_vk_effect_image *dst =
+			(cur == bufs->effects) ? bufs->effects_swapped : bufs->effects;
+		int sw = w >> (i + 1), sh = h >> (i + 1);
+		render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR1,
+			&down, sizeof(down),
+			(VkRect2D){ .extent = { sw < 1 ? 1 : sw, sh < 1 ? 1 : sh } });
+		cur = dst;
+	}
+	for (int i = n - 1; i >= 0; i--) {
+		struct fx_vk_effect_image *dst =
+			(cur == bufs->effects) ? bufs->effects_swapped : bufs->effects;
+		int sw = w >> i, sh = h >> i;
+		render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR2,
+			&up, sizeof(up),
+			(VkRect2D){ .extent = { sw < 1 ? 1 : sw, sh < 1 ? 1 : sh } });
+		cur = dst;
+	}
+
+	// Optional brightness/contrast/saturation/noise post pass (Phase D wires
+	// this into the pipeline; here it produces the final blurred image).
+	if (blur_data_should_parameters_blur_effects((struct blur_data *)blur_data)) {
+		struct { float brightness, contrast, saturation, noise; } fx = {
+			blur_data->brightness, blur_data->contrast,
+			blur_data->saturation, blur_data->noise };
+		struct fx_vk_effect_image *dst =
+			(cur == bufs->effects) ? bufs->effects_swapped : bufs->effects;
+		render_effect_blur_pass(pass, cur, dst,
+			WLR_VK_SHADER_SOURCE_BLUR_EFFECTS, &fx, sizeof(fx),
+			(VkRect2D){ .extent = { w, h } });
+		cur = dst;
+	}
+
+	return cur;
 }
 
 
