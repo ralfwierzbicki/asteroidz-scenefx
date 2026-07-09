@@ -37,32 +37,38 @@ needed HDR and a handful of scene-level effects upstream doesn't have yet.
 
 ## Building
 
-Dependencies: wlroots 0.20, wayland, libdrm, xkbcommon, pixman.
+Dependencies: wlroots 0.20, wayland, libdrm, xkbcommon, pixman. For the
+Vulkan (`fx_vk`) renderer also install the Vulkan loader/headers and
+`glslang` (to compile the effect shaders to SPIR-V).
 
 ```bash
-meson setup build --prefix=/usr
+meson setup build --prefix=/usr -Drenderers=gles2,vulkan
 ninja -C build
 sudo ninja -C build install
 ```
 
-asteroidz links against this as `scenefx-0.5`. Install with
-`--prefix=/usr` so it lands beside the system `wlroots0.20`; the stock
-`scenefx` packages are 0.3/0.4 and won't satisfy asteroidz's
-`scenefx-0.5` dependency.
+This fork is renamed **asteroidz-scenefx** to avoid clashing with an
+upstream `scenefx`: it installs as `libasteroidz-scenefx-0.5` /
+`asteroidz-scenefx-0.5.pc`, and asteroidz depends on it as
+`asteroidz-scenefx-0.5`. Build with `-Drenderers=gles2,vulkan` so both
+renderers are available (asteroidz defaults to Vulkan, with GLES2 as a
+fallback session). Install with `--prefix=/usr` so it lands beside the
+system `wlroots0.20`.
 
 ### Arch Linux
 
 `wlroots0.20` is in the official `extra` repo; everything else is in the
-base repos. There's no separate scenefx package to conflict with — this
-fork installs its own `scenefx-0.5` pkg-config file.
+base repos. There's no separate `asteroidz-scenefx` package to conflict
+with — this fork installs its own `asteroidz-scenefx-0.5` pkg-config file.
 
 ```bash
 sudo pacman -S --needed base-devel git meson ninja \
-  wlroots0.20 wayland wayland-protocols libdrm libxkbcommon pixman
+  wlroots0.20 wayland wayland-protocols libdrm libxkbcommon pixman \
+  vulkan-icd-loader vulkan-headers glslang
 
 git clone https://github.com/ralfwierzbicki/asteroidz-scenefx.git
 cd asteroidz-scenefx
-meson setup build --prefix=/usr
+meson setup build --prefix=/usr -Drenderers=gles2,vulkan
 ninja -C build
 sudo ninja -C build install
 ```
