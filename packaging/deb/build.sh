@@ -12,6 +12,7 @@ WLROOTS_TAG="${WLROOTS_TAG:-0.20.1}"
 ARCH="$(dpkg --print-architecture)"
 OUT="${OUT:-$REPO/dist}"; mkdir -p "$OUT"
 MAINTAINER="${MAINTAINER:-ralf <ralf.wierzbicki@gmail.com>}"
+SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"   # no sudo needed inside a root container
 
 meson_version() { meson introspect "$1" --projectinfo | python3 -c 'import sys,json;print(json.load(sys.stdin)["version"])'; }
 
@@ -33,8 +34,8 @@ fpm -s dir -t deb -f -n wlroots-0.20 -v "$WLROOTS_TAG" --iteration 1 -a "$ARCH" 
   -p "$OUT/wlroots-0.20_${WLROOTS_TAG}-1_${ARCH}.deb" \
   -C /tmp/wlroots/pkgroot usr
 # install into the runner so scenefx's pkg-config lookup of wlroots-0.20 succeeds
-sudo meson install -C /tmp/wlroots/build
-sudo ldconfig
+$SUDO meson install -C /tmp/wlroots/build
+$SUDO ldconfig
 echo "::endgroup::"
 
 # --- 2. asteroidz-scenefx ----------------------------------------------------
