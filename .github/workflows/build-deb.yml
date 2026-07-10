@@ -1,0 +1,55 @@
+name: build-deb
+
+on:
+  push:
+    tags: ['*.*.*', 'v*']
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      wlroots_tag:
+        description: wlroots 0.20 git tag to build against
+        default: '0.20.1'
+
+jobs:
+  deb:
+    name: Build .deb (Ubuntu 26.04)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential meson ninja-build pkg-config cmake git ca-certificates python3 \
+            ruby ruby-dev \
+            libwayland-dev wayland-protocols libdrm-dev libxkbcommon-dev libpixman-1-dev \
+            libinput-dev libudev-dev libgbm-dev libseat-dev hwdata libdisplay-info-dev \
+            libvulkan-dev glslang-tools glslang-dev \
+            libxcb1-dev libxcb-composite0-dev libxcb-icccm4-dev libxcb-res0-dev \
+            libxcb-ewmh-dev libxcb-render-util0-dev libxcb-errors-dev
+          # names that vary across Ubuntu releases — try new, fall back to old
+          sudo apt-get install -y libegl-dev libgles-dev \
+            || sudo apt-get install -y libegl1-mesa-dev libgles2-mesa-dev
+          sudo gem install --no-document fpm
+
+      - name: Build packages
+        env:
+          OUT: ${{ github.workspace }}/dist
+          WLROOTS_TAG: ${{ github.event.inputs.wlroots_tag || '0.20.1' }}
+        run: bash packaging/deb/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asteroidz-scenefx-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.deb --clobber
