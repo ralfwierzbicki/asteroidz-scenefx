@@ -720,9 +720,13 @@ bool fx_vulkan_setup_two_pass_framebuffer(struct fx_vk_render_buffer *buffer,
 		.tiling = VK_IMAGE_TILING_OPTIMAL,
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 		.extent = (VkExtent3D) { dmabuf->width, dmabuf->height, 1 },
-		// The scene image is both a colour attachment (the scene pass draws
-		// into it) and sampled (the output pass reads it via a sampler2D).
-		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		// The scene image is a colour attachment (the scene pass draws into
+		// it), sampled (the output pass reads it via a sampler2D) and a
+		// transfer SOURCE (the blur paths vkCmdCopyImage it into the effect
+		// buffers -- copying without this bit is a spec violation,
+		// VUID-vkCmdCopyImage-aspect-06662).
+		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	};
 
 	res = vkCreateImage(dev, &img_info, NULL, &buffer->two_pass.blend_image);
@@ -937,7 +941,13 @@ struct fx_vk_effect_image *fx_vk_effect_image_create(
 		.tiling = VK_IMAGE_TILING_OPTIMAL,
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 		.extent = (VkExtent3D){ width, height, 1 },
-		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		// Attachment + sampled for the blur ping-pong; TRANSFER_SRC/DST for
+		// the vkCmdCopyImage snapshot/cache copies (scene -> effects,
+		// result -> optimized_blur, scene -> optimized_no_blur). Copying
+		// without these bits violates VUID-vkCmdCopyImage-aspect-06662/3.
+		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+			VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 	};
 	res = vkCreateImage(dev, &img_info, NULL, &img->image);
 	if (res != VK_SUCCESS) {
