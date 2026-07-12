@@ -45,9 +45,12 @@ void main() {
 		return;
 	}
 	uvec2 px = data.offset + gl_GlobalInvocationID.xy;
-	// Same uv the full-buffer quad produces at this fragment position.
+	// Mip semantics: source is the previous chain mip bound as its own
+	// single-level view, so the SAME normalized coordinate addresses the
+	// same spatial position -- no *2 rescale. halfpixel is pushed per level
+	// (1 / source-mip size), preserving the full-size kernel's texel reach.
 	vec2 uv = (vec2(px) + 0.5) / vec2(imageSize(out_img));
-	vec2 c = uv * 2.0;
+	vec2 c = uv;
 
 	HVEC4 sum = HVEC4(texture(tex, c)) * HF(4.0);
 	sum += HVEC4(texture(tex, c - data.halfpixel.xy * data.radius));

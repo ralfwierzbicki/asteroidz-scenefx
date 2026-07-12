@@ -881,8 +881,13 @@ void fx_vk_effect_image_destroy(struct fx_vk_effect_image *img) {
 		fx_vulkan_free_ds(img->renderer, img->ds_pool, img->ds);
 	}
 	if (img->comp_ds_pool) {
-		// frees comp_src_ds/comp_dst_ds with it
+		// frees comp_src_ds/comp_dst_ds and the mip sets with it
 		vkDestroyDescriptorPool(dev, img->comp_ds_pool, NULL);
+	}
+	for (int i = 0; i < FX_VK_BLUR_CHAIN_MAX_MIPS; i++) {
+		if (img->mip_views[i]) {
+			vkDestroyImageView(dev, img->mip_views[i], NULL);
+		}
 	}
 	if (img->framebuffer) {
 		vkDestroyFramebuffer(dev, img->framebuffer, NULL);
@@ -900,7 +905,8 @@ void fx_vk_effect_image_destroy(struct fx_vk_effect_image *img) {
 }
 
 struct fx_vk_effect_image *fx_vk_effect_image_create(
-		struct fx_vk_renderer *renderer, int width, int height) {
+		struct fx_vk_renderer *renderer, int width, int height,
+		int mip_levels) {
 	if (width <= 0 || height <= 0) {
 		return NULL;
 	}
@@ -932,9 +938,22 @@ struct fx_vk_effect_image *fx_vk_effect_image_create(
 	if (img == NULL) {
 		return NULL;
 	}
+	if (mip_levels < 1) {
+		mip_levels = 1;
+	}
+	// each mip must be at least 1x1
+	while (mip_levels > 1 && ((width >> (mip_levels - 1)) < 1 ||
+			(height >> (mip_levels - 1)) < 1)) {
+		mip_levels--;
+	}
+	if (mip_levels > FX_VK_BLUR_CHAIN_MAX_MIPS) {
+		mip_levels = FX_VK_BLUR_CHAIN_MAX_MIPS;
+	}
+
 	img->renderer = renderer;
 	img->width = width;
 	img->height = height;
+	img->mip_levels = mip_levels;
 	img->render_setup = setup;
 	img->layout = layout;
 
@@ -942,7 +961,7 @@ struct fx_vk_effect_image *fx_vk_effect_image_create(
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.imageType = VK_IMAGE_TYPE_2D,
 		.format = fmt->vk,
-		.mipLevels = 1,
+		.mipLevels = mip_levels,
 		.arrayLayers = 1,
 		.samples = VK_SAMPLE_COUNT_1_BIT,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -1049,15 +1068,16 @@ struct fx_vk_effect_image *fx_vk_effect_image_create(
 	// storage set from a small dedicated pool. Failure just disables the
 	// compute path for this image (fx_vk_render_pass_blur checks the sets).
 	if (renderer->blur_compute_ok) {
+		uint32_t n_each = 1 + (mip_levels > 1 ? (uint32_t)mip_levels : 0);
 		VkDescriptorPoolSize pool_sizes[] = {
 			{ .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-				.descriptorCount = 1 },
+				.descriptorCount = n_each },
 			{ .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-				.descriptorCount = 1 },
+				.descriptorCount = n_each },
 		};
 		VkDescriptorPoolCreateInfo pool_info = {
 			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-			.maxSets = 2,
+			.maxSets = 2 * n_each,
 			.poolSizeCount = 2,
 			.pPoolSizes = pool_sizes,
 		};
@@ -1109,16 +1129,93 @@ struct fx_vk_effect_image *fx_vk_effect_image_create(
 				vkUpdateDescriptorSets(dev, 2, comp_writes, 0, NULL);
 			}
 		}
+
+		// Per-mip single-level views + compute descriptors (blur chain).
+		for (int i = 0; img->comp_ds_pool != VK_NULL_HANDLE &&
+				mip_levels > 1 && i < mip_levels; i++) {
+			VkImageViewCreateInfo mip_view_info = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+				.image = img->image,
+				.viewType = VK_IMAGE_VIEW_TYPE_2D,
+				.format = fmt->vk,
+				.subresourceRange = (VkImageSubresourceRange){
+					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+					.baseMipLevel = i,
+					.levelCount = 1,
+					.layerCount = 1,
+				},
+			};
+			res = vkCreateImageView(dev, &mip_view_info, NULL,
+				&img->mip_views[i]);
+			if (res != VK_SUCCESS) {
+				fx_vk_error("effect: mip view", res);
+				goto error;
+			}
+			VkDescriptorSetLayout mip_layouts[] = {
+				renderer->blur_comp_src_ds_layout,
+				renderer->blur_comp_dst_ds_layout,
+			};
+			VkDescriptorSetAllocateInfo mip_alloc = {
+				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+				.descriptorPool = img->comp_ds_pool,
+				.descriptorSetCount = 2,
+				.pSetLayouts = mip_layouts,
+			};
+			VkDescriptorSet mip_sets[2];
+			res = vkAllocateDescriptorSets(dev, &mip_alloc, mip_sets);
+			if (res != VK_SUCCESS) {
+				fx_vk_error("effect: mip ds alloc", res);
+				goto error;
+			}
+			img->mip_src_ds[i] = mip_sets[0];
+			img->mip_dst_ds[i] = mip_sets[1];
+			VkDescriptorImageInfo mip_img_info = {
+				.imageView = img->mip_views[i],
+				.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+			};
+			VkWriteDescriptorSet mip_writes[] = {
+				{
+					.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+					.descriptorCount = 1,
+					.descriptorType =
+						VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+					.dstSet = img->mip_src_ds[i],
+					.pImageInfo = &mip_img_info,
+				},
+				{
+					.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+					.descriptorCount = 1,
+					.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+					.dstSet = img->mip_dst_ds[i],
+					.pImageInfo = &mip_img_info,
+				},
+			};
+			vkUpdateDescriptorSets(dev, 2, mip_writes, 0, NULL);
+		}
 	}
 
 	// Move UNDEFINED -> GENERAL up-front so the effect render pass (initial
 	// layout GENERAL) and later sampling are both valid. Recorded on the stage
 	// command buffer, which flushes before this image is used.
 	VkCommandBuffer cb = fx_vulkan_record_stage_cb(renderer);
-	fx_vulkan_change_layout(cb, img->image,
-		VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-		VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+	// fx_vulkan_change_layout only covers one level; transition EVERY mip
+	// (the blur chain's higher mips are dispatch targets from frame one).
+	VkImageMemoryBarrier init_barrier = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.image = img->image,
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.levelCount = VK_REMAINING_MIP_LEVELS,
+			.layerCount = 1,
+		},
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+	};
+	vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 0, NULL, 0, NULL, 1, &init_barrier);
 
 	return img;
 
@@ -1146,6 +1243,7 @@ void fx_vk_effect_buffers_destroy(struct fx_vk_effect_buffers *bufs) {
 	fx_vk_effect_image_destroy(bufs->optimized_blur);
 	fx_vk_effect_image_destroy(bufs->optimized_no_blur);
 	fx_vk_effect_image_destroy(bufs->blur_saved_pixels);
+	fx_vk_effect_image_destroy(bufs->blur_chain);
 	wl_list_remove(&bufs->link);
 	wlr_addon_finish(&bufs->addon);
 	free(bufs);
@@ -1172,11 +1270,17 @@ struct fx_vk_effect_buffers *fx_vk_effect_buffers_get(
 	bufs->renderer = renderer;
 	bufs->width = width;
 	bufs->height = height;
-	bufs->effects = fx_vk_effect_image_create(renderer, width, height);
-	bufs->effects_swapped = fx_vk_effect_image_create(renderer, width, height);
-	bufs->optimized_blur = fx_vk_effect_image_create(renderer, width, height);
-	bufs->optimized_no_blur = fx_vk_effect_image_create(renderer, width, height);
-	bufs->blur_saved_pixels = fx_vk_effect_image_create(renderer, width, height);
+	bufs->effects = fx_vk_effect_image_create(renderer, width, height, 1);
+	bufs->effects_swapped = fx_vk_effect_image_create(renderer, width, height, 1);
+	bufs->optimized_blur = fx_vk_effect_image_create(renderer, width, height, 1);
+	bufs->optimized_no_blur = fx_vk_effect_image_create(renderer, width, height, 1);
+	bufs->blur_saved_pixels = fx_vk_effect_image_create(renderer, width, height, 1);
+	if (renderer->blur_compute_ok) {
+		// Mipped chain for the compute blur; on failure blur_chain stays
+		// NULL and the blur falls back to the graphics ping-pong.
+		bufs->blur_chain = fx_vk_effect_image_create(renderer, width, height,
+			FX_VK_BLUR_CHAIN_MAX_MIPS);
+	}
 	if (!bufs->effects || !bufs->effects_swapped || !bufs->optimized_blur
 			|| !bufs->optimized_no_blur || !bufs->blur_saved_pixels) {
 		fx_vk_effect_image_destroy(bufs->effects);

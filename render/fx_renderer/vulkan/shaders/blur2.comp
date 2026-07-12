@@ -112,8 +112,10 @@ void main() {
 		return;
 	}
 	uvec2 px = data.offset + gl_GlobalInvocationID.xy;
+	// Mip semantics (see blur1.comp): same normalized position, per-level
+	// halfpixel (0.25 / source-mip size).
 	vec2 uv = (vec2(px) + 0.5) / vec2(imageSize(out_img));
-	vec2 c = uv / 2.0;
+	vec2 c = uv;
 
 	HVEC4 sum = HVEC4(texture(tex, c + vec2(-data.halfpixel.x * 2.0, 0.0) * data.radius));
 

@@ -1513,7 +1513,7 @@ static void blur_compute_barrier(VkCommandBuffer cb,
 // render_effect_blur_pass's scaled scissor. MUST be called with no render
 // pass active. The caller is responsible for barriers between iterations.
 static void render_effect_blur_dispatch(struct fx_vk_render_pass *pass,
-		struct fx_vk_effect_image *src, struct fx_vk_effect_image *dst,
+		VkDescriptorSet src_ds, VkDescriptorSet dst_ds,
 		VkPipeline pipe, const struct fx_vk_blur_pcr *pcr, VkRect2D rect) {
 	struct fx_vk_renderer *renderer = pass->renderer;
 	VkCommandBuffer cb = pass->command_buffer->vk;
@@ -1523,7 +1523,7 @@ static void render_effect_blur_dispatch(struct fx_vk_render_pass *pass,
 		.extent = { rect.extent.width, rect.extent.height },
 		.offset = { rect.offset.x, rect.offset.y },
 	};
-	VkDescriptorSet sets[] = { src->comp_src_ds, dst->comp_dst_ds };
+	VkDescriptorSet sets[] = { src_ds, dst_ds };
 
 	vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
 	vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1542,6 +1542,28 @@ static void render_effect_blur_dispatch(struct fx_vk_render_pass *pass,
 // only the scissor scales (>>(i+1) down, >>i up) while halfpixel is constant.
 // Runs as compute dispatches when the renderer supports it (no render-pass
 // begin/end per iteration); otherwise as the graphics ping-pong passes.
+static void copy_effect_image_region(struct fx_vk_render_pass *pass,
+	VkImage src, VkImage dst, const struct wlr_box *box);
+
+// Clamp a level rect to the actual mip extent: ceil-scaling the region can
+// overshoot floor-scaled mip dimensions by one texel, and imageStore past
+// the mip extent is undefined without robustImageAccess.
+static void clamp_rect_to_mip(VkRect2D *rect, int w, int h, int shift) {
+	uint32_t mw = (uint32_t)((w >> shift) < 1 ? 1 : (w >> shift));
+	uint32_t mh = (uint32_t)((h >> shift) < 1 ? 1 : (h >> shift));
+	if ((uint32_t)rect->offset.x >= mw || (uint32_t)rect->offset.y >= mh) {
+		rect->extent.width = 0;
+		rect->extent.height = 0;
+		return;
+	}
+	if (rect->offset.x + rect->extent.width > mw) {
+		rect->extent.width = mw - rect->offset.x;
+	}
+	if (rect->offset.y + rect->extent.height > mh) {
+		rect->extent.height = mh - rect->offset.y;
+	}
+}
+
 // The write rect for one blur level: `box` scaled down by `shift`, anchored
 // with floor and sized with ceil so coverage never shrinks below the region.
 static VkRect2D blur_level_rect(const struct wlr_box *box, int shift) {
@@ -1605,42 +1627,95 @@ struct fx_vk_effect_image *fx_vk_render_pass_blur(struct fx_vk_render_pass *pass
 	struct fx_vk_effect_image *cur = source;
 	int n = blur_data->num_passes;
 
-	// Compute path: needs the renderer pipelines plus per-image compute
-	// descriptor sets on every image the ping-pong touches.
+	// Compute path: walks the mipped blur chain in place -- down passes
+	// write mip i+1 sampling mip i, up passes write mip i sampling mip i+1,
+	// result lands in mip 0 (better cache locality than the two full-size
+	// ping-pong images, whose scaled levels touch sparse full-res rows).
 	struct fx_vk_renderer *renderer = pass->renderer;
-	bool use_compute = renderer->blur_compute_ok &&
-		source->comp_src_ds != VK_NULL_HANDLE &&
-		bufs->effects->comp_dst_ds != VK_NULL_HANDLE &&
-		bufs->effects_swapped->comp_dst_ds != VK_NULL_HANDLE;
+	struct fx_vk_effect_image *chain = bufs->blur_chain;
+	bool use_compute = renderer->blur_compute_ok && chain != NULL &&
+		chain->mip_levels > 1 && chain->mip_dst_ds[0] != VK_NULL_HANDLE;
 
 	if (use_compute) {
 		VkCommandBuffer cb = pass->command_buffer->vk;
-		// The source was just filled by a vkCmdCopyImage (or earlier graphics
-		// work); make it visible to compute sampling, and order the storage
-		// writes after any prior reads of the ping-pong images.
+		if (n > chain->mip_levels - 1) {
+			n = chain->mip_levels - 1;
+		}
+		// Stage the source into chain mip 0 unless the caller already did
+		// (the live path copies the blend image straight into the chain).
+		if (source != chain) {
+			copy_effect_image_region(pass, source->image, chain->image, &rbox);
+		}
+		// Source (transfer write or earlier graphics work) -> compute; also
+		// orders the storage writes after any prior reads of the chain.
 		blur_compute_barrier(cb,
 			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
 			VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+		// halfpixel is mip-relative (0.5 texel of the SOURCE mip pitch is
+		// 1/size for the down taps, 0.25/size for the up taps -- same texel
+		// reach as the full-size formulation, see blur1/2.comp).
+		for (int i = 0; i < n; i++) {
+			int sw = bufs->width >> i, sh = bufs->height >> i;
+			struct fx_vk_blur_pcr d = down;
+			d.halfpixel[0] = 1.0f / (sw < 1 ? 1 : sw);
+			d.halfpixel[1] = 1.0f / (sh < 1 ? 1 : sh);
+			VkRect2D lrect = blur_level_rect(&rbox, i + 1);
+			clamp_rect_to_mip(&lrect, bufs->width, bufs->height, i + 1);
+			render_effect_blur_dispatch(pass, chain->mip_src_ds[i],
+				chain->mip_dst_ds[i + 1], renderer->blur_down_comp_pipe,
+				&d, lrect);
+			blur_compute_barrier(cb,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_ACCESS_SHADER_WRITE_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+		}
+		for (int i = n - 1; i >= 0; i--) {
+			int sw = bufs->width >> (i + 1), sh = bufs->height >> (i + 1);
+			struct fx_vk_blur_pcr u = up;
+			u.halfpixel[0] = 0.25f / (sw < 1 ? 1 : sw);
+			u.halfpixel[1] = 0.25f / (sh < 1 ? 1 : sh);
+			if (i == 0 && want_effects) {
+				u.apply_effects = 1.0f;
+				u.brightness = blur_data->brightness;
+				u.contrast = blur_data->contrast;
+				u.saturation = blur_data->saturation;
+				u.noise = blur_data->noise;
+			}
+			VkRect2D lrect = blur_level_rect(&rbox, i);
+			clamp_rect_to_mip(&lrect, bufs->width, bufs->height, i);
+			render_effect_blur_dispatch(pass, chain->mip_src_ds[i + 1],
+				chain->mip_dst_ds[i], renderer->blur_up_comp_pipe,
+				&u, lrect);
+			if (i > 0) {
+				blur_compute_barrier(cb,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					VK_ACCESS_SHADER_WRITE_BIT,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+			}
+		}
+
+		// Result (chain mip 0) gets sampled by fragment shaders and/or
+		// copied to the optimized-blur cache (transfer).
+		blur_compute_barrier(cb,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+				VK_ACCESS_TRANSFER_WRITE_BIT);
+		return chain;
 	}
 
 	for (int i = 0; i < n; i++) {
 		struct fx_vk_effect_image *dst =
 			(cur == bufs->effects) ? bufs->effects_swapped : bufs->effects;
 		VkRect2D lrect = blur_level_rect(&rbox, i + 1);
-		if (use_compute) {
-			render_effect_blur_dispatch(pass, cur, dst,
-				renderer->blur_down_comp_pipe, &down, lrect);
-			blur_compute_barrier(pass->command_buffer->vk,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				VK_ACCESS_SHADER_WRITE_BIT,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-		} else {
-			render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR1,
-				&down, sizeof(down), lrect);
-		}
+		render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR1,
+			&down, sizeof(down), lrect);
 		cur = dst;
 	}
 	for (int i = n - 1; i >= 0; i--) {
@@ -1656,32 +1731,9 @@ struct fx_vk_effect_image *fx_vk_render_pass_blur(struct fx_vk_render_pass *pass
 			up.saturation = blur_data->saturation;
 			up.noise = blur_data->noise;
 		}
-		if (use_compute) {
-			render_effect_blur_dispatch(pass, cur, dst,
-				renderer->blur_up_comp_pipe, &up, lrect);
-			if (i > 0) {
-				blur_compute_barrier(pass->command_buffer->vk,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					VK_ACCESS_SHADER_WRITE_BIT,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-			}
-		} else {
-			render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR2,
-				&up, sizeof(up), lrect);
-		}
+		render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR2,
+			&up, sizeof(up), lrect);
 		cur = dst;
-	}
-
-	if (use_compute) {
-		// Result gets sampled by fragment shaders (render_effect_image) and/or
-		// copied to the optimized-blur cache (transfer).
-		blur_compute_barrier(pass->command_buffer->vk,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			VK_ACCESS_SHADER_WRITE_BIT,
-			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-				VK_ACCESS_TRANSFER_WRITE_BIT);
 	}
 
 	return cur;
@@ -2172,13 +2224,18 @@ void fx_vk_render_pass_add_blur(struct wlr_render_pass *wlr_pass,
 			VkCommandBuffer cb = pass->command_buffer->vk;
 			vkCmdEndRenderPass(cb);
 			pass->bound_pipeline = VK_NULL_HANDLE;
-			/* snapshot the live scene into the ping-pong set's spare image
-			 * (effects buffers are about to be overwritten by the blur anyway;
-			 * optimized_no_blur must stay intact for strength re-blurs) */
+			/* snapshot the live scene straight into the blur target: chain
+			 * mip 0 on the compute path (saves the intermediate hop), else
+			 * the ping-pong spare (optimized_no_blur must stay intact for
+			 * strength re-blurs) */
+			struct fx_vk_effect_image *live_src =
+				(pass->renderer->blur_compute_ok && bufs->blur_chain != NULL &&
+					bufs->blur_chain->mip_levels > 1)
+				? bufs->blur_chain : bufs->effects;
 			copy_effect_image_region(pass,
 				pass->render_buffer->two_pass.blend_image,
-				bufs->effects->image, &blur_region);
-			src = fx_vk_render_pass_blur(pass, bufs, bufs->effects, &bd,
+				live_src->image, &blur_region);
+			src = fx_vk_render_pass_blur(pass, bufs, live_src, &bd,
 				&blur_region);
 			begin_scene_pass_reload(pass);
 		} else if (options->blur_strength < 1.0f && is_scene_blur_enabled(&bd) &&

@@ -250,6 +250,10 @@ struct fx_vk_render_format_setup {
 // VK_IMAGE_LAYOUT_GENERAL for its whole life so ping-pong passes need no manual
 // layout transitions — the effect render pass uses GENERAL init/final and its
 // subpass dependencies guard the colour-write -> shader-read hazard.
+// Mip depth cap for the blur chain (num_passes above this is clamped; the
+// deepest useful Kawase level on a 4K output is ~7 anyway).
+#define FX_VK_BLUR_CHAIN_MAX_MIPS 8
+
 struct fx_vk_effect_image {
 	struct fx_vk_renderer *renderer;
 	int width, height;
@@ -273,6 +277,17 @@ struct fx_vk_effect_image {
 	VkDescriptorPool comp_ds_pool;
 	VkDescriptorSet comp_src_ds; // set 0: sampled src
 	VkDescriptorSet comp_dst_ds; // set 1: storage dst
+
+	// Mip-chain data (the blur_chain image only; mip_levels == 1 for plain
+	// effect images). The compute dual-Kawase walks the chain in place: down
+	// passes write mip i+1 sampling mip i, up passes write mip i sampling
+	// mip i+1, result lands in mip 0. Each mip gets its own single-level
+	// view plus compute sampled/storage descriptors; the fragment `ds` above
+	// stays restricted to mip 0.
+	int mip_levels;
+	VkImageView mip_views[FX_VK_BLUR_CHAIN_MAX_MIPS];
+	VkDescriptorSet mip_src_ds[FX_VK_BLUR_CHAIN_MAX_MIPS];
+	VkDescriptorSet mip_dst_ds[FX_VK_BLUR_CHAIN_MAX_MIPS];
 };
 
 // Per-output set of effect images, mirroring the GLES fx_offscreen_buffers.
@@ -284,9 +299,12 @@ struct fx_vk_effect_buffers {
 	struct fx_vk_renderer *renderer;
 	int width, height;
 
-	// Blur ping-pong pair.
+	// Blur ping-pong pair (graphics blur path).
 	struct fx_vk_effect_image *effects;
 	struct fx_vk_effect_image *effects_swapped;
+	// Mipped blur chain (compute blur path; NULL when compute is unavailable
+	// or its allocation failed -- the blur then uses the pair above).
+	struct fx_vk_effect_image *blur_chain;
 	// Cached whole-background blur + its unblurred source (for strength<1).
 	struct fx_vk_effect_image *optimized_blur;
 	struct fx_vk_effect_image *optimized_no_blur;
@@ -358,7 +376,7 @@ bool fx_vulkan_setup_two_pass_framebuffer(struct fx_vk_render_buffer *buffer,
 
 // scenefx effect (blur) offscreen buffers (fx_vk fork).
 struct fx_vk_effect_image *fx_vk_effect_image_create(
-	struct fx_vk_renderer *renderer, int width, int height);
+	struct fx_vk_renderer *renderer, int width, int height, int mip_levels);
 void fx_vk_effect_image_destroy(struct fx_vk_effect_image *img);
 // Per-output effect-buffer set, created/resized lazily and cached on the output.
 struct fx_vk_effect_buffers *fx_vk_effect_buffers_get(
