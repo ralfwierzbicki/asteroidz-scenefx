@@ -1,0 +1,45 @@
+#version 450
+
+// scenefx dual-Kawase downsample, compute variant (fx_vk fork). Same kernel
+// and coordinate math as blur1.frag: one invocation per destination pixel in
+// the scaled-down region (data.extent, the graphics path's scissor), sampling
+// the source at 2x the normalized destination coordinate with the bilinear
+// sampler so the 5-tap kernel gets the same hardware-filtered taps.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D tex;
+layout(set = 1, binding = 0, rgba16f) writeonly uniform image2D out_img;
+
+// Matches fx_vk_blur_compute_pcr: the graphics fx_vk_blur_pcr block (32 bytes)
+// followed by the write-region extent (the compute replacement for the
+// scissor). apply_effects..noise are unused in the downsample but keep the
+// push layout shared with blur2.comp.
+layout(push_constant) uniform UBO {
+	vec2 halfpixel;
+	float radius;
+	float apply_effects;
+	float brightness;
+	float contrast;
+	float saturation;
+	float noise;
+	uvec2 extent;
+} data;
+
+void main() {
+	uvec2 px = gl_GlobalInvocationID.xy;
+	if (px.x >= data.extent.x || px.y >= data.extent.y) {
+		return;
+	}
+	// Same uv the full-buffer quad produces at this fragment position.
+	vec2 uv = (vec2(px) + 0.5) / vec2(imageSize(out_img));
+	vec2 c = uv * 2.0;
+
+	vec4 sum = texture(tex, c) * 4.0;
+	sum += texture(tex, c - data.halfpixel.xy * data.radius);
+	sum += texture(tex, c + data.halfpixel.xy * data.radius);
+	sum += texture(tex, c + vec2(data.halfpixel.x, -data.halfpixel.y) * data.radius);
+	sum += texture(tex, c - vec2(data.halfpixel.x, -data.halfpixel.y) * data.radius);
+
+	imageStore(out_img, ivec2(px), sum / 8.0);
+}

@@ -1,16 +1,18 @@
 #version 450
 
-// scenefx dual-Kawase upsample (fx_vk fork). Ports the GLES shaders/blur2.frag
-// verbatim: samples the source at 1/2 the fragment texcoord (the source is half
-// the size of this target) with the Kawase 8-tap tent kernel.
+// scenefx dual-Kawase upsample, compute variant (fx_vk fork). Same 8-tap tent
+// kernel, coordinate math and final-iteration effects fold-in as blur2.frag:
+// one invocation per destination pixel in the scaled region (data.extent),
+// sampling the half-size source at uv / 2 with the bilinear sampler.
+
+layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D tex;
+layout(set = 1, binding = 0, rgba16f) writeonly uniform image2D out_img;
 
-layout(location = 0) in vec2 uv;   // v_texcoord in [0,1] across the target
-layout(location = 0) out vec4 out_color;
-
+// Matches fx_vk_blur_compute_pcr (see blur1.comp).
 layout(push_constant) uniform UBO {
-	layout(offset = 80) vec2 halfpixel;
+	vec2 halfpixel;
 	float radius;
 	// Final-iteration fold-in of the blur post effects (saves the separate
 	// blur_effects fullscreen pass): 0 = plain upsample.
@@ -19,6 +21,7 @@ layout(push_constant) uniform UBO {
 	float contrast;
 	float saturation;
 	float noise;
+	uvec2 extent;
 } data;
 
 mat4 brightnessMatrix() {
@@ -59,11 +62,10 @@ float noiseAmount(vec2 p) {
 }
 
 // Brightness/contrast/saturation are applied in PERCEPTUAL (gamma 2.2) space
-// on straight alpha: the GLES renderer runs them on gamma-encoded values, so
-// doing the same here keeps the configured look identical between renderers
-// (in linear 16F the same matrix reads much harsher on dark content). The
-// buffer is premultiplied, so unpremultiply first and re-premultiply after --
-// which also alpha-scales the (straight-alpha) noise correctly.
+// on straight alpha, exactly as in blur2.frag (see the comment there for why:
+// GLES parity on gamma-encoded values). The buffer is premultiplied, so
+// unpremultiply first and re-premultiply after -- which also alpha-scales the
+// (straight-alpha) noise correctly.
 vec4 apply_blur_effects(vec4 color, vec2 p) {
 	float a = color.a;
 	vec3 rgb = a > 0.0 ? color.rgb / a : vec3(0.0);
@@ -76,6 +78,11 @@ vec4 apply_blur_effects(vec4 color, vec2 p) {
 }
 
 void main() {
+	uvec2 px = gl_GlobalInvocationID.xy;
+	if (px.x >= data.extent.x || px.y >= data.extent.y) {
+		return;
+	}
+	vec2 uv = (vec2(px) + 0.5) / vec2(imageSize(out_img));
 	vec2 c = uv / 2.0;
 
 	vec4 sum = texture(tex, c + vec2(-data.halfpixel.x * 2.0, 0.0) * data.radius);
@@ -92,5 +99,5 @@ void main() {
 	if (data.apply_effects > 0.5) {
 		color = apply_blur_effects(color, uv);
 	}
-	out_color = color;
+	imageStore(out_img, ivec2(px), color);
 }

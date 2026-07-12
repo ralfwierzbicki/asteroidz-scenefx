@@ -263,6 +263,14 @@ struct fx_vk_effect_image {
 	struct fx_vk_descriptor_pool *ds_pool;
 	const struct fx_vk_pipeline_layout *layout;
 	struct fx_vk_render_format_setup *render_setup; // 16F effect render pass
+
+	// Compute-blur descriptors (only when renderer->blur_compute_ok): the
+	// fragment-stage `ds` above can't be bound to a compute pipeline, so the
+	// image carries its own compute-visible sampled set + storage set,
+	// allocated from a small dedicated pool. VK_NULL_HANDLE otherwise.
+	VkDescriptorPool comp_ds_pool;
+	VkDescriptorSet comp_src_ds; // set 0: sampled src
+	VkDescriptorSet comp_dst_ds; // set 1: storage dst
 };
 
 // Per-output set of effect images, mirroring the GLES fx_offscreen_buffers.
@@ -390,6 +398,17 @@ struct fx_vk_renderer {
 	struct wlr_backend *backend;
 	struct fx_vk_device *dev;
 
+	// maxPushConstantsSize-derived viability: end of the fragment push range
+	// the shared layout was built with (min(224, device budget)). Effects
+	// whose push block ends beyond this degrade gracefully (rounded ->
+	// square, gradient -> first-stop solid, shadow -> skipped) instead of
+	// failing pipeline-layout creation for EVERY pipeline.
+	uint32_t frag_push_end;
+	// Raw device maxPushConstantsSize. frag_push_end above is capped at the
+	// shared tex layout's 224-byte end, so checks for blocks beyond that (the
+	// 244-byte masked-blur layout) must use this instead.
+	uint32_t max_push_size;
+
 	VkCommandPool command_pool;
 
 	// Persistent pipeline cache (fx_vk fork): seeded from disk at create and
@@ -416,6 +435,21 @@ struct fx_vk_renderer {
 	VkShaderModule blur_effects_frag_module;
 	VkShaderModule quad_grad_round_frag_module;
 	VkShaderModule tex_mask_round_frag_module;
+
+	// Compute dual-Kawase blur (fx_vk fork): built in init_static_render_data
+	// when the queue family supports compute and the 16F effect format supports
+	// storage images; blur_compute_ok == false leaves everything VK_NULL_HANDLE
+	// and fx_vk_render_pass_blur uses the graphics ping-pong passes instead.
+	// Set 0 = sampled src (compute-visible combined-image-sampler, immutable
+	// bilinear sampler), set 1 = storage dst; push = fx_vk_blur_compute_pcr.
+	bool blur_compute_ok;
+	VkShaderModule blur1_comp_module;
+	VkShaderModule blur2_comp_module;
+	VkDescriptorSetLayout blur_comp_src_ds_layout;
+	VkDescriptorSetLayout blur_comp_dst_ds_layout;
+	VkPipelineLayout blur_comp_pipe_layout;
+	VkPipeline blur_down_comp_pipe;
+	VkPipeline blur_up_comp_pipe;
 
 	struct wl_list pipeline_layouts; // struct fx_vk_pipeline_layout.link
 
@@ -499,6 +533,8 @@ struct fx_vk_frag_output_pcr_data {
 	float matrix[4][4]; // only a 3x3 subset is used
 	float lut_3d_offset;
 	float lut_3d_scale;
+	// 1/(2^bits - 1) of the output encoding for the IGN dither; 0 disables.
+	float dither_quantum;
 };
 
 // Per-draw rounded-corner + interior-clip parameters for scenefx's rounded
@@ -531,6 +567,29 @@ struct fx_vk_frag_corner_pcr_data {
 // push range to 224 + sizeof(fx_vk_frag_mask_pcr_data) = 244, still within the
 // 256-byte maxPushConstantsSize budget (vert uses 0..80).
 #define FX_VK_TEX_MASK_PCR_OFFSET 224
+
+// blur1/blur2 fragment push block (offset 80, see the shaders). The trailing
+// effects members are consumed by blur2 only, on the final upsample iteration
+// (apply_effects != 0) -- the old separate blur_effects fullscreen pass is
+// folded into that draw.
+struct fx_vk_blur_pcr {
+	float halfpixel[2];
+	float radius;
+	float apply_effects;
+	float brightness;
+	float contrast;
+	float saturation;
+	float noise;
+};
+
+// Compute-blur push block (offset 0, VK_SHADER_STAGE_COMPUTE_BIT): the
+// graphics block plus the write-region extent in pixels -- the compute
+// replacement for the graphics path's scaled scissor. Matches the UBO in
+// blur1.comp / blur2.comp (std430: uvec2 at offset 32, total 40 bytes).
+struct fx_vk_blur_compute_pcr {
+	struct fx_vk_blur_pcr base;
+	uint32_t extent[2];
+};
 
 // Per-draw transparency-mask parameters for the masked per-window/layer blur
 // (fx_vk fork). std430 push-constant rules: two vec2 (8-byte aligned) followed

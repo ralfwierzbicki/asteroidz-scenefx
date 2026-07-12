@@ -310,6 +310,25 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 			.lut_3d_scale = (float)(dim - 1) / dim,
 		};
 
+		/* IGN dither at one quantum of the OUTPUT encoding: turns the
+		 * quantization banding of dark gradients into imperceptible noise.
+		 * Pick the quantum from the render target's bit depth; float targets
+		 * don't band and get no dither. */
+		switch (pass->render_buffer->two_pass.render_setup->render_format->vk) {
+		case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+		case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+			frag_pcr_data.dither_quantum = 1.0f / 1023.0f;
+			break;
+		case VK_FORMAT_R16G16B16A16_SFLOAT:
+		case VK_FORMAT_R16G16B16A16_UNORM:
+			// float/16-bit targets don't band perceptibly
+			frag_pcr_data.dither_quantum = 0.0f;
+			break;
+		default: /* 8-bit UNORM family */
+			frag_pcr_data.dither_quantum = 1.0f / 255.0f;
+			break;
+		}
+
 		encode_color_matrix(matrix, frag_pcr_data.matrix);
 
 		VkPipeline pipeline = VK_NULL_HANDLE;
@@ -818,7 +837,9 @@ static void render_texture(struct fx_vk_render_pass *pass,
 	struct fx_vk_renderer *renderer = pass->renderer;
 	VkCommandBuffer cb = pass->command_buffer->vk;
 
+	/* texture_round's push block ends at 224; degrade to square below that */
 	bool use_effects = fx_options != NULL &&
+		pass->renderer->frag_push_end >= 224 &&
 		(!fx_corner_fradii_is_empty(&fx_options->corners) ||
 			clipped_fregion_is_valid(&fx_options->clipped_region));
 
@@ -1146,7 +1167,13 @@ void fx_vk_render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 
 void fx_vk_render_pass_add_rounded_rect(struct wlr_render_pass *wlr_pass,
 		const struct fx_render_rounded_rect_options *options) {
-	render_rounded_rect(get_render_pass(wlr_pass), &options->base,
+	struct fx_vk_render_pass *pass = get_render_pass(wlr_pass);
+	/* quad_round's push block ends at 160; below that budget draw square */
+	if (pass->renderer->frag_push_end < 160) {
+		render_pass_add_rect(wlr_pass, &options->base);
+		return;
+	}
+	render_rounded_rect(pass, &options->base,
 		&options->corners, &options->clipped_region);
 }
 
@@ -1263,7 +1290,10 @@ void fx_vk_render_pass_add_rounded_rect_grad(struct wlr_render_pass *wlr_pass,
 	struct fx_vk_render_pass *pass = get_render_pass(wlr_pass);
 
 	// Real gradient for the common 2-stop case (asteroidz border gradients).
-	if (options->gradient.count == 2 && options->gradient.colors != NULL) {
+	// quad_grad_round's push block ends at 224: on smaller budgets fall
+	// through to the solid first-stop path below (which needs only 160/96).
+	if (pass->renderer->frag_push_end >= 224 &&
+			options->gradient.count == 2 && options->gradient.colors != NULL) {
 		render_rounded_rect_grad(pass, options);
 		return;
 	}
@@ -1280,6 +1310,13 @@ void fx_vk_render_pass_add_rounded_rect_grad(struct wlr_render_pass *wlr_pass,
 			.b = options->gradient.colors[2],
 			.a = options->gradient.colors[3],
 		};
+	}
+	// The solid fallback still pushes the corner block ending at 160; below
+	// that budget degrade to a square rect like fx_vk_render_pass_add_rounded_rect.
+	if (pass->renderer->frag_push_end < 160) {
+		struct wlr_render_rect_options square = base;
+		render_pass_add_rect(wlr_pass, &square);
+		return;
 	}
 	render_rounded_rect(pass, &base, &options->corners, &options->clipped_region);
 }
@@ -1308,6 +1345,17 @@ static void render_box_shadow(struct fx_vk_render_pass *pass,
 
 	pixman_region32_t clip;
 	get_clip_region(pass, options->clip, &clip);
+	// Restrict the clip to the shadow's own box before drawing: the scissored
+	// draws below then cover only the rects that actually intersect the shadow
+	// (a fully visible shadow collapses to a single draw), instead of one draw
+	// per damage rect on the whole output, and a fully clipped-out shadow
+	// skips pipeline setup entirely.
+	pixman_region32_intersect_rect(&clip, &clip,
+		box.x, box.y, box.width, box.height);
+	if (!pixman_region32_not_empty(&clip)) {
+		pixman_region32_fini(&clip);
+		return;
+	}
 
 	int clip_rects_len;
 	const pixman_box32_t *clip_rects = pixman_region32_rectangles(&clip, &clip_rects_len);
@@ -1318,10 +1366,7 @@ static void render_box_shadow(struct fx_vk_render_pass *pass,
 			.width = clip_rects[i].x2 - clip_rects[i].x1,
 			.height = clip_rects[i].y2 - clip_rects[i].y1,
 		};
-		struct wlr_box intersection;
-		if (wlr_box_intersection(&intersection, &box, &clip_box)) {
-			render_pass_mark_box_updated(pass, &intersection);
-		}
+		render_pass_mark_box_updated(pass, &clip_box);
 	}
 
 	float proj[9], matrix[9];
@@ -1376,16 +1421,15 @@ static void render_box_shadow(struct fx_vk_render_pass *pass,
 
 void fx_vk_render_pass_add_box_shadow(struct wlr_render_pass *wlr_pass,
 		const struct fx_render_box_shadow_options *options) {
-	render_box_shadow(get_render_pass(wlr_pass), options);
+	struct fx_vk_render_pass *pass = get_render_pass(wlr_pass);
+	/* box_shadow's push block ends at 164; below that budget skip shadows */
+	if (pass->renderer->frag_push_end < 164) {
+		return;
+	}
+	render_box_shadow(pass, options);
 }
 
 // ---- dual-Kawase blur orchestration (fx_vk fork) ----------------------------
-
-// blur1/blur2/blur_effects fragment push block (offset 80, see the shaders).
-struct fx_vk_blur_pcr {
-	float halfpixel[2];
-	float radius;
-};
 
 // One Kawase iteration: begins its OWN render pass into dst, samples src, ends.
 // MUST be called with no render pass active (the blur runs between main-pass
@@ -1449,11 +1493,54 @@ static void render_effect_blur_pass(struct fx_vk_render_pass *pass,
 	pass->bound_pipeline = VK_NULL_HANDLE;
 }
 
+// Global memory barrier between blur compute stages. Effect images live in
+// GENERAL layout for their whole life, so no layout transitions are needed --
+// only execution/memory dependencies.
+static void blur_compute_barrier(VkCommandBuffer cb,
+		VkPipelineStageFlags src_stages, VkAccessFlags src_access,
+		VkPipelineStageFlags dst_stages, VkAccessFlags dst_access) {
+	VkMemoryBarrier barrier = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+		.srcAccessMask = src_access,
+		.dstAccessMask = dst_access,
+	};
+	vkCmdPipelineBarrier(cb, src_stages, dst_stages, 0,
+		1, &barrier, 0, NULL, 0, NULL);
+}
+
+// One compute Kawase iteration: samples src (set 0) and imageStores into dst
+// (set 1) over the extent x extent region -- the compute equivalent of
+// render_effect_blur_pass's scaled scissor. MUST be called with no render
+// pass active. The caller is responsible for barriers between iterations.
+static void render_effect_blur_dispatch(struct fx_vk_render_pass *pass,
+		struct fx_vk_effect_image *src, struct fx_vk_effect_image *dst,
+		VkPipeline pipe, const struct fx_vk_blur_pcr *pcr,
+		uint32_t extent_w, uint32_t extent_h) {
+	struct fx_vk_renderer *renderer = pass->renderer;
+	VkCommandBuffer cb = pass->command_buffer->vk;
+
+	struct fx_vk_blur_compute_pcr cpcr = {
+		.base = *pcr,
+		.extent = { extent_w, extent_h },
+	};
+	VkDescriptorSet sets[] = { src->comp_src_ds, dst->comp_dst_ds };
+
+	vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+	vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+		renderer->blur_comp_pipe_layout, 0, 2, sets, 0, NULL);
+	vkCmdPushConstants(cb, renderer->blur_comp_pipe_layout,
+		VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cpcr), &cpcr);
+	// 8x8 workgroups (see blur1/2.comp local_size)
+	vkCmdDispatch(cb, (extent_w + 7) / 8, (extent_h + 7) / 8, 1);
+}
+
 // Blurs `source` (an effect image holding the content to blur) with the
 // dual-Kawase down/upsample and returns the effect image holding the result
 // (one of bufs->effects / bufs->effects_swapped). Mirrors the GLES
 // get_main_buffer_blur down/up loop: dst/src boxes are always the full buffer;
 // only the scissor scales (>>(i+1) down, >>i up) while halfpixel is constant.
+// Runs as compute dispatches when the renderer supports it (no render-pass
+// begin/end per iteration); otherwise as the graphics ping-pong passes.
 struct fx_vk_effect_image *fx_vk_render_pass_blur(struct fx_vk_render_pass *pass,
 		struct fx_vk_effect_buffers *bufs, struct fx_vk_effect_image *source,
 		const struct blur_data *blur_data) {
@@ -1466,41 +1553,93 @@ struct fx_vk_effect_image *fx_vk_render_pass_blur(struct fx_vk_render_pass *pass
 	// across passes (the source is always the full-size buffer).
 	struct fx_vk_blur_pcr down = { { 1.0f / w, 1.0f / h }, blur_data->radius };
 	struct fx_vk_blur_pcr up = { { 0.25f / w, 0.25f / h }, blur_data->radius };
+	bool want_effects = blur_data_should_parameters_blur_effects(
+		(struct blur_data *)blur_data);
 
 	struct fx_vk_effect_image *cur = source;
 	int n = blur_data->num_passes;
+
+	// Compute path: needs the renderer pipelines plus per-image compute
+	// descriptor sets on every image the ping-pong touches.
+	struct fx_vk_renderer *renderer = pass->renderer;
+	bool use_compute = renderer->blur_compute_ok &&
+		source->comp_src_ds != VK_NULL_HANDLE &&
+		bufs->effects->comp_dst_ds != VK_NULL_HANDLE &&
+		bufs->effects_swapped->comp_dst_ds != VK_NULL_HANDLE;
+
+	if (use_compute) {
+		VkCommandBuffer cb = pass->command_buffer->vk;
+		// The source was just filled by a vkCmdCopyImage (or earlier graphics
+		// work); make it visible to compute sampling, and order the storage
+		// writes after any prior reads of the ping-pong images.
+		blur_compute_barrier(cb,
+			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+	}
 
 	for (int i = 0; i < n; i++) {
 		struct fx_vk_effect_image *dst =
 			(cur == bufs->effects) ? bufs->effects_swapped : bufs->effects;
 		int sw = w >> (i + 1), sh = h >> (i + 1);
-		render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR1,
-			&down, sizeof(down),
-			(VkRect2D){ .extent = { sw < 1 ? 1 : sw, sh < 1 ? 1 : sh } });
+		if (use_compute) {
+			render_effect_blur_dispatch(pass, cur, dst,
+				renderer->blur_down_comp_pipe, &down,
+				sw < 1 ? 1 : sw, sh < 1 ? 1 : sh);
+			blur_compute_barrier(pass->command_buffer->vk,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_ACCESS_SHADER_WRITE_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+		} else {
+			render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR1,
+				&down, sizeof(down),
+				(VkRect2D){ .extent = { sw < 1 ? 1 : sw, sh < 1 ? 1 : sh } });
+		}
 		cur = dst;
 	}
 	for (int i = n - 1; i >= 0; i--) {
 		struct fx_vk_effect_image *dst =
 			(cur == bufs->effects) ? bufs->effects_swapped : bufs->effects;
 		int sw = w >> i, sh = h >> i;
-		render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR2,
-			&up, sizeof(up),
-			(VkRect2D){ .extent = { sw < 1 ? 1 : sw, sh < 1 ? 1 : sh } });
+		// Fold the brightness/contrast/saturation/noise post effects into the
+		// FINAL upsample draw instead of a separate fullscreen pass.
+		if (i == 0 && want_effects) {
+			up.apply_effects = 1.0f;
+			up.brightness = blur_data->brightness;
+			up.contrast = blur_data->contrast;
+			up.saturation = blur_data->saturation;
+			up.noise = blur_data->noise;
+		}
+		if (use_compute) {
+			render_effect_blur_dispatch(pass, cur, dst,
+				renderer->blur_up_comp_pipe, &up,
+				sw < 1 ? 1 : sw, sh < 1 ? 1 : sh);
+			if (i > 0) {
+				blur_compute_barrier(pass->command_buffer->vk,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					VK_ACCESS_SHADER_WRITE_BIT,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+			}
+		} else {
+			render_effect_blur_pass(pass, cur, dst, WLR_VK_SHADER_SOURCE_BLUR2,
+				&up, sizeof(up),
+				(VkRect2D){ .extent = { sw < 1 ? 1 : sw, sh < 1 ? 1 : sh } });
+		}
 		cur = dst;
 	}
 
-	// Optional brightness/contrast/saturation/noise post pass (Phase D wires
-	// this into the pipeline; here it produces the final blurred image).
-	if (blur_data_should_parameters_blur_effects((struct blur_data *)blur_data)) {
-		struct { float brightness, contrast, saturation, noise; } fx = {
-			blur_data->brightness, blur_data->contrast,
-			blur_data->saturation, blur_data->noise };
-		struct fx_vk_effect_image *dst =
-			(cur == bufs->effects) ? bufs->effects_swapped : bufs->effects;
-		render_effect_blur_pass(pass, cur, dst,
-			WLR_VK_SHADER_SOURCE_BLUR_EFFECTS, &fx, sizeof(fx),
-			(VkRect2D){ .extent = { w, h } });
-		cur = dst;
+	if (use_compute) {
+		// Result gets sampled by fragment shaders (render_effect_image) and/or
+		// copied to the optimized-blur cache (transfer).
+		blur_compute_barrier(pass->command_buffer->vk,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+				VK_ACCESS_TRANSFER_WRITE_BIT);
 	}
 
 	return cur;
@@ -1565,8 +1704,9 @@ static void render_effect_image(struct fx_vk_render_pass *pass,
 		return;
 	}
 
-	bool use_effects = !fx_corner_fradii_is_empty(corners) ||
-		clipped_fregion_is_valid(clipped_region);
+	bool use_effects = pass->renderer->frag_push_end >= 224 &&
+		(!fx_corner_fradii_is_empty(corners) ||
+			clipped_fregion_is_valid(clipped_region));
 
 	float proj[9], matrix[9];
 	wlr_matrix_identity(proj);
@@ -1686,6 +1826,14 @@ static void render_effect_image_masked(struct fx_vk_render_pass *pass,
 	// a YCbCr mask can't be bound there. Transparency masks are RGBA surfaces in
 	// practice; bail to a plain (unmasked) blur draw rather than crash if not.
 	if (fx_vulkan_format_is_ycbcr(mask->format)) {
+		render_effect_image(pass, src, dst_box, clip, corners,
+			clipped_region, clip_box, alpha);
+		return;
+	}
+
+	// The 244-byte mask layout wasn't created (device push budget too small);
+	// draw the blur unmasked instead.
+	if (renderer->tex_mask_pipe_layout == VK_NULL_HANDLE) {
 		render_effect_image(pass, src, dst_box, clip, corners,
 			clipped_region, clip_box, alpha);
 		return;

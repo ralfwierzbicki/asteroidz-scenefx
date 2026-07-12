@@ -76,7 +76,11 @@ float corner_alpha(vec2 relative_pos, vec2 size, bool is_cutout,
 		max(get_dist(bottom_left, radius_bl), get_dist(bottom_right, radius_br))
 	);
 
-	float result = smoothstep(0.0, 1.0, dist);
+	// Derivative-scaled anti-aliasing: ~1 DEVICE pixel of smoothing however
+	// the box is scaled (output scale, overview thumbnails), instead of a
+	// fixed 1 layout-unit band. Helper invocations keep fwidth defined.
+	float aa = max(fwidth(dist), 1e-4);
+	float result = smoothstep(0.0, aa, dist);
 	return is_cutout ? result : 1.0 - result;
 }
 

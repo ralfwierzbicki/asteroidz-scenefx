@@ -33,6 +33,8 @@
 #include "box_shadow.frag.h"
 #include "blur1.frag.h"
 #include "blur2.frag.h"
+#include "blur1.comp.h"
+#include "blur2.comp.h"
 #include "blur_effects.frag.h"
 #include "quad_grad_round.frag.h"
 #include "texture_mask_round.frag.h"
@@ -876,6 +878,10 @@ void fx_vk_effect_image_destroy(struct fx_vk_effect_image *img) {
 	if (img->ds_pool) {
 		fx_vulkan_free_ds(img->renderer, img->ds_pool, img->ds);
 	}
+	if (img->comp_ds_pool) {
+		// frees comp_src_ds/comp_dst_ds with it
+		vkDestroyDescriptorPool(dev, img->comp_ds_pool, NULL);
+	}
 	if (img->framebuffer) {
 		vkDestroyFramebuffer(dev, img->framebuffer, NULL);
 	}
@@ -947,7 +953,9 @@ struct fx_vk_effect_image *fx_vk_effect_image_create(
 		// without these bits violates VUID-vkCmdCopyImage-aspect-06662/3.
 		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
 			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-			VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+			VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+			// storage writes from the compute blur dispatches
+			(renderer->blur_compute_ok ? VK_IMAGE_USAGE_STORAGE_BIT : 0),
 	};
 	res = vkCreateImage(dev, &img_info, NULL, &img->image);
 	if (res != VK_SUCCESS) {
@@ -1033,6 +1041,73 @@ struct fx_vk_effect_image *fx_vk_effect_image_create(
 		.pImageInfo = &ds_img_info,
 	};
 	vkUpdateDescriptorSets(dev, 1, &ds_write, 0, NULL);
+
+	// Compute-blur descriptors: the fragment-stage `ds` above can't be bound
+	// to a compute pipeline, so allocate a compute-visible sampled set and a
+	// storage set from a small dedicated pool. Failure just disables the
+	// compute path for this image (fx_vk_render_pass_blur checks the sets).
+	if (renderer->blur_compute_ok) {
+		VkDescriptorPoolSize pool_sizes[] = {
+			{ .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.descriptorCount = 1 },
+			{ .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+				.descriptorCount = 1 },
+		};
+		VkDescriptorPoolCreateInfo pool_info = {
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+			.maxSets = 2,
+			.poolSizeCount = 2,
+			.pPoolSizes = pool_sizes,
+		};
+		res = vkCreateDescriptorPool(dev, &pool_info, NULL, &img->comp_ds_pool);
+		if (res != VK_SUCCESS) {
+			fx_vk_error("effect: compute ds pool", res);
+			img->comp_ds_pool = VK_NULL_HANDLE;
+		} else {
+			VkDescriptorSetLayout comp_layouts[] = {
+				renderer->blur_comp_src_ds_layout,
+				renderer->blur_comp_dst_ds_layout,
+			};
+			VkDescriptorSetAllocateInfo comp_alloc = {
+				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+				.descriptorPool = img->comp_ds_pool,
+				.descriptorSetCount = 2,
+				.pSetLayouts = comp_layouts,
+			};
+			VkDescriptorSet comp_sets[2];
+			res = vkAllocateDescriptorSets(dev, &comp_alloc, comp_sets);
+			if (res != VK_SUCCESS) {
+				fx_vk_error("effect: compute ds alloc", res);
+				vkDestroyDescriptorPool(dev, img->comp_ds_pool, NULL);
+				img->comp_ds_pool = VK_NULL_HANDLE;
+			} else {
+				img->comp_src_ds = comp_sets[0];
+				img->comp_dst_ds = comp_sets[1];
+				VkDescriptorImageInfo storage_img_info = {
+					.imageView = img->image_view,
+					.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+				};
+				VkWriteDescriptorSet comp_writes[] = {
+					{
+						.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+						.descriptorCount = 1,
+						.descriptorType =
+							VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+						.dstSet = img->comp_src_ds,
+						.pImageInfo = &ds_img_info,
+					},
+					{
+						.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+						.descriptorCount = 1,
+						.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+						.dstSet = img->comp_dst_ds,
+						.pImageInfo = &storage_img_info,
+					},
+				};
+				vkUpdateDescriptorSets(dev, 2, comp_writes, 0, NULL);
+			}
+		}
+	}
 
 	// Move UNDEFINED -> GENERAL up-front so the effect render pass (initial
 	// layout GENERAL) and later sampling are both valid. Recorded on the stage
@@ -1610,6 +1685,15 @@ static void fx_vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 
 	vkDestroyPipelineLayout(dev->dev, renderer->tex_mask_pipe_layout, NULL);
 
+	// compute blur objects (all VK_NULL_HANDLE when unsupported)
+	vkDestroyShaderModule(dev->dev, renderer->blur1_comp_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->blur2_comp_module, NULL);
+	vkDestroyPipeline(dev->dev, renderer->blur_down_comp_pipe, NULL);
+	vkDestroyPipeline(dev->dev, renderer->blur_up_comp_pipe, NULL);
+	vkDestroyPipelineLayout(dev->dev, renderer->blur_comp_pipe_layout, NULL);
+	vkDestroyDescriptorSetLayout(dev->dev, renderer->blur_comp_src_ds_layout, NULL);
+	vkDestroyDescriptorSetLayout(dev->dev, renderer->blur_comp_dst_ds_layout, NULL);
+
 	struct fx_vk_pipeline_layout *pipeline_layout, *pipeline_layout_tmp;
 	wl_list_for_each_safe(pipeline_layout, pipeline_layout_tmp,
 			&renderer->pipeline_layouts, link) {
@@ -1969,7 +2053,20 @@ static bool init_tex_layouts(struct fx_vk_renderer *renderer,
 	// at 96, extends to 160). See fx_vk_frag_corner_pcr_data for why push
 	// constants are used and the maxPushConstantsSize budget (target: 256).
 	const uint32_t vert_pcr_size = sizeof(struct fx_vk_vert_pcr_data); // 80
-	const uint32_t frag_corner_end = 160 + sizeof(struct fx_vk_frag_corner_pcr_data); // 224
+	uint32_t frag_corner_end = 160 + sizeof(struct fx_vk_frag_corner_pcr_data); // 224
+	// Budget hardening: never request more than the device offers -- a too-
+	// large range fails vkCreatePipelineLayout for EVERY pipeline sharing this
+	// layout (plain textures included). Clamp and let the per-effect viability
+	// checks in pass.c degrade the rounded effects instead.
+	if (renderer->frag_push_end > 0 && frag_corner_end > renderer->frag_push_end) {
+		frag_corner_end = renderer->frag_push_end;
+	}
+	// Floor at the plain-texture block end (80 + 72 = 152): every texture
+	// draw pushes that much, so a range below it would trade a loud layout-
+	// creation failure for silent out-of-range vkCmdPushConstants UB.
+	if (frag_corner_end < 152) {
+		frag_corner_end = 152;
+	}
 	VkPushConstantRange pc_ranges[] = {
 		{
 			.size = vert_pcr_size,
@@ -2738,6 +2835,181 @@ static bool init_dummy_images(struct fx_vk_renderer *renderer) {
 // Creates static render data, such as sampler, layouts and shader modules
 // for the given renderer.
 // Cleanup is done by destroying the renderer.
+
+// Compute dual-Kawase setup (fx_vk fork). Optional: leaves
+// renderer->blur_compute_ok false (graphics blur fallback) when the queue
+// family lacks compute, the 16F effect format lacks storage-image support, or
+// any Vulkan object fails to build. Only allocation/driver errors return
+// false.
+static bool init_blur_compute(struct fx_vk_renderer *renderer) {
+	VkDevice dev = renderer->dev->dev;
+	VkResult res;
+
+	// The renderer records everything on one queue; that queue family must
+	// support compute for the dispatches to be legal.
+	uint32_t qf_count = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(renderer->dev->phdev,
+		&qf_count, NULL);
+	if (renderer->dev->queue_family >= qf_count) {
+		return true;
+	}
+	VkQueueFamilyProperties *qf_props =
+		calloc(qf_count, sizeof(*qf_props));
+	if (qf_props == NULL) {
+		return false;
+	}
+	vkGetPhysicalDeviceQueueFamilyProperties(renderer->dev->phdev,
+		&qf_count, qf_props);
+	bool has_compute = qf_props[renderer->dev->queue_family].queueFlags &
+		VK_QUEUE_COMPUTE_BIT;
+	free(qf_props);
+	if (!has_compute) {
+		wlr_log(WLR_INFO, "fx_vk: queue family lacks compute; "
+			"blur uses graphics passes");
+		return true;
+	}
+
+	// blur1/2.comp write the destination as an rgba16f storage image; the
+	// effect-image format must support that (mandatory for 16F per spec, but
+	// stay defensive).
+	VkFormatProperties fmt_props;
+	vkGetPhysicalDeviceFormatProperties(renderer->dev->phdev,
+		VK_FORMAT_R16G16B16A16_SFLOAT, &fmt_props);
+	if (!(fmt_props.optimalTilingFeatures &
+			VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+		wlr_log(WLR_INFO, "fx_vk: 16F lacks storage-image support; "
+			"blur uses graphics passes");
+		return true;
+	}
+
+	VkShaderModuleCreateInfo sinfo = {
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(blur1_comp_data),
+		.pCode = blur1_comp_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->blur1_comp_module);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create blur1 compute shader module", res);
+		return false;
+	}
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(blur2_comp_data),
+		.pCode = blur2_comp_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->blur2_comp_module);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("Failed to create blur2 compute shader module", res);
+		return false;
+	}
+
+	// Set 0: sampled source. The shared tex DS layout is fragment-stage only,
+	// so build a compute-visible twin around the same immutable bilinear
+	// sampler (the kernels rely on hardware bilinear taps).
+	struct fx_vk_pipeline_layout *tex_layout = get_or_create_pipeline_layout(
+		renderer, &(struct fx_vk_pipeline_layout_key){
+			.filter_mode = WLR_SCALE_FILTER_BILINEAR });
+	if (tex_layout == NULL) {
+		return false;
+	}
+	VkDescriptorSetLayoutBinding src_binding = {
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+		.pImmutableSamplers = &tex_layout->sampler,
+	};
+	VkDescriptorSetLayoutCreateInfo src_ds_info = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &src_binding,
+	};
+	res = vkCreateDescriptorSetLayout(dev, &src_ds_info, NULL,
+		&renderer->blur_comp_src_ds_layout);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("blur compute src ds layout", res);
+		return false;
+	}
+
+	// Set 1: storage destination.
+	VkDescriptorSetLayoutBinding dst_binding = {
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+	};
+	VkDescriptorSetLayoutCreateInfo dst_ds_info = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &dst_binding,
+	};
+	res = vkCreateDescriptorSetLayout(dev, &dst_ds_info, NULL,
+		&renderer->blur_comp_dst_ds_layout);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("blur compute dst ds layout", res);
+		return false;
+	}
+
+	VkDescriptorSetLayout set_layouts[] = {
+		renderer->blur_comp_src_ds_layout,
+		renderer->blur_comp_dst_ds_layout,
+	};
+	VkPushConstantRange pc_range = {
+		.size = sizeof(struct fx_vk_blur_compute_pcr),
+		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+	};
+	VkPipelineLayoutCreateInfo pl_info = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = 2,
+		.pSetLayouts = set_layouts,
+		.pushConstantRangeCount = 1,
+		.pPushConstantRanges = &pc_range,
+	};
+	res = vkCreatePipelineLayout(dev, &pl_info, NULL,
+		&renderer->blur_comp_pipe_layout);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("blur compute pipeline layout", res);
+		return false;
+	}
+
+	VkComputePipelineCreateInfo pipe_infos[] = {
+		{
+			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+			.layout = renderer->blur_comp_pipe_layout,
+			.stage = {
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+				.stage = VK_SHADER_STAGE_COMPUTE_BIT,
+				.module = renderer->blur1_comp_module,
+				.pName = "main",
+			},
+		},
+		{
+			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+			.layout = renderer->blur_comp_pipe_layout,
+			.stage = {
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+				.stage = VK_SHADER_STAGE_COMPUTE_BIT,
+				.module = renderer->blur2_comp_module,
+				.pName = "main",
+			},
+		},
+	};
+	VkPipeline pipes[2];
+	res = vkCreateComputePipelines(dev, renderer->pipeline_cache, 2,
+		pipe_infos, NULL, pipes);
+	if (res != VK_SUCCESS) {
+		fx_vk_error("blur compute pipelines", res);
+		return false;
+	}
+	renderer->blur_down_comp_pipe = pipes[0];
+	renderer->blur_up_comp_pipe = pipes[1];
+	renderer->pipeline_cache_dirty = true;
+
+	renderer->blur_compute_ok = true;
+	wlr_log(WLR_INFO, "fx_vk: compute dual-Kawase blur enabled");
+	return true;
+}
+
 static bool init_static_render_data(struct fx_vk_renderer *renderer) {
 	VkResult res;
 	VkDevice dev = renderer->dev->dev;
@@ -2902,6 +3174,12 @@ static bool init_static_render_data(struct fx_vk_renderer *renderer) {
 	const uint32_t vert_pcr_size = sizeof(struct fx_vk_vert_pcr_data); // 80
 	const uint32_t mask_frag_end =
 		FX_VK_TEX_MASK_PCR_OFFSET + sizeof(struct fx_vk_frag_mask_pcr_data); // 244
+	if (renderer->max_push_size < mask_frag_end) {
+		// Device push budget can't fit the mask block; leave the layout NULL
+		// (the masked-blur path falls back to unmasked draws) and skip only
+		// the mask layout, not the rest of the init.
+		return init_blur_compute(renderer);
+	}
 	VkDescriptorSetLayout mask_set_layouts[] = {
 		tex_layout->ds, tex_layout->ds,
 	};
@@ -2927,6 +3205,10 @@ static bool init_static_render_data(struct fx_vk_renderer *renderer) {
 		&renderer->tex_mask_pipe_layout);
 	if (res != VK_SUCCESS) {
 		fx_vk_error("Failed to create masked-blur pipeline layout", res);
+		return false;
+	}
+
+	if (!init_blur_compute(renderer)) {
 		return false;
 	}
 
@@ -3269,10 +3551,15 @@ struct wlr_renderer *fx_vulkan_renderer_create_for_device(struct fx_vk_device *d
 	unsigned max_pcr = phdev_props.limits.maxPushConstantsSize;
 	wlr_log(WLR_INFO, "fx_vk: maxPushConstantsSize = %u bytes "
 		"(rounded-rect effects need up to 224)", max_pcr);
+	renderer->frag_push_end =
+		max_pcr < 224 ? max_pcr : 224;
+	renderer->max_push_size = max_pcr;
 	if (max_pcr < 160 + sizeof(struct fx_vk_frag_corner_pcr_data)) {
 		wlr_log(WLR_ERROR, "fx_vk: maxPushConstantsSize (%u) is below the "
-			"224 bytes needed for rounded textures; those effects will fail to "
-			"build pipelines and degrade to no-ops on this device", max_pcr);
+			"224 bytes needed for rounded textures; rounded corners/gradients/"
+			"shadows degrade (square corners, solid borders, no shadows). "
+			"Base rendering keeps working down to 152 bytes; below that the "
+			"pipeline layouts fail outright", max_pcr);
 	}
 
 	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
