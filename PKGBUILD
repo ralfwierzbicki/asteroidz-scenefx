@@ -1,7 +1,7 @@
 # Maintainer: ralf <ralf.wierzbicki@gmail.com>
 pkgname=asteroidz-scenefx
 pkgver=0.5.0
-pkgrel=1
+pkgrel=2
 pkgdesc='scenefx fork for asteroidz — wlroots effects library with GLES2 and Vulkan (fx_vk) renderers'
 arch=('x86_64')
 url='https://github.com/asteroidzman/asteroidz-scenefx'
