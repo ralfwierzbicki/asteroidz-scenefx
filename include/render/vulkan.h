@@ -509,7 +509,7 @@ struct fx_vk_frag_output_pcr_data {
 // (72, padded to 80) + corner(64) = 224 bytes, which fits. The rounded quad
 // needs vert(80) + color(16) + corner(64) = 160 bytes. If a device ever
 // reports a smaller limit, only the rounded pipeline layout creation fails and
-// those effects degrade to no-ops; base texture/rect rendering is unaffected.
+// those effects degrade to no-ops; NB: the shared pipeline layout bakes this range in, so a smaller-budget device fails layout creation for ALL pipelines, not just the rounded effects.
 //
 // Layout matches std430 push-constant rules: vec4-aligned members (radius,
 // clip_radius) sit at 16-byte-aligned offsets within the struct, and the

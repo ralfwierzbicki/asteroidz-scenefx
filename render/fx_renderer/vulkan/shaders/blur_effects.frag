@@ -57,6 +57,8 @@ void main() {
 	vec4 color = texture(tex, uv);
 	// Do *not* transpose the combined matrix when multiplying
 	color = brightnessMatrix() * contrastMatrix() * saturationMatrix() * color;
-	color.xyz += noiseAmount(uv);
+	// scale the noise by alpha: the buffer is premultiplied, and un-backed RGB
+	// (rgb > a) composites ADDITIVELY over the destination (src factor ONE)
+	color.xyz += noiseAmount(uv) * color.a;
 	out_color = color;
 }
