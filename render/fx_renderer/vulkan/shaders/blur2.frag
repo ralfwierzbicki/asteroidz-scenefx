@@ -59,11 +59,13 @@ float noiseAmount(vec2 p) {
 }
 
 // Brightness/contrast/saturation are applied in PERCEPTUAL (gamma 2.2) space
-// on straight alpha: the GLES renderer runs them on gamma-encoded values, so
-// doing the same here keeps the configured look identical between renderers
-// (in linear 16F the same matrix reads much harsher on dark content). The
-// buffer is premultiplied, so unpremultiply first and re-premultiply after --
-// which also alpha-scales the (straight-alpha) noise correctly.
+// on straight alpha because that is what these legacy colour-matrix controls
+// assume (additive brightness lift, contrast pivoting on 0.5 mid-grey):
+// applied to linear 16F values the same matrices crush shadows and pivot on
+// the wrong grey. The gamma round-trip costs two pow() chains on the final
+// upsample only. The buffer is premultiplied, so unpremultiply first and
+// re-premultiply after -- which also alpha-scales the (straight-alpha) noise
+// correctly. (GLES happens to match; that is incidental, not a constraint.)
 vec4 apply_blur_effects(vec4 color, vec2 p) {
 	float a = color.a;
 	vec3 rgb = a > 0.0 ? color.rgb / a : vec3(0.0);

@@ -63,9 +63,9 @@ float noiseAmount(vec2 p) {
 
 // Brightness/contrast/saturation are applied in PERCEPTUAL (gamma 2.2) space
 // on straight alpha, exactly as in blur2.frag (see the comment there for why:
-// GLES parity on gamma-encoded values). The buffer is premultiplied, so
-// unpremultiply first and re-premultiply after -- which also alpha-scales the
-// (straight-alpha) noise correctly.
+// these matrix controls assume gamma-encoded values with a 0.5 mid-grey).
+// The buffer is premultiplied, so unpremultiply first and re-premultiply
+// after -- which also alpha-scales the (straight-alpha) noise correctly.
 vec4 apply_blur_effects(vec4 color, vec2 p) {
 	float a = color.a;
 	vec3 rgb = a > 0.0 ? color.rgb / a : vec3(0.0);
