@@ -3,5 +3,10 @@ build/
 .cache/
 result
 
+# makepkg build artifacts
+*.pkg.tar.zst
+src/
+pkg/
+
 !subprojects/tracy.wrap
 !subprojects/packagefiles
