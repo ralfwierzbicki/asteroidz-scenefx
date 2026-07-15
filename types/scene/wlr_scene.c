@@ -3609,6 +3609,16 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 
 	bool scanout = scanout_result == SCANOUT_SUCCESS;
 	if (scene_output->prev_scanout != scanout) {
+		/* Leaving direct scan-out: the swapchain buffers and (for the fx_vk
+		 * two-pass HDR/PQ pipeline) the persistent scene image were never
+		 * touched by the compositing render pass while scanned out, so
+		 * whatever damage-ring/buffer-age history exists for them predates
+		 * the scan-out period and cannot be trusted to reconstruct it.
+		 * Force a full redraw on the first composited frame after scan-out
+		 * ends so no stale content survives into the resolve/output pass. */
+		if (scene_output->prev_scanout && !scanout) {
+			scene_output_damage_whole(scene_output);
+		}
 		scene_output->prev_scanout = scanout;
 		wlr_log(WLR_DEBUG, "Direct scan-out %s",
 			scanout ? "enabled" : "disabled");
