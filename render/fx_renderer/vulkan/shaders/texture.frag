@@ -36,6 +36,17 @@ vec3 srgb_color_to_linear(vec3 color) {
 }
 
 vec3 pq_color_to_linear(vec3 color) {
+	// The caller's max(rgb, 0) already keeps color >= 0; this only needs to
+	// cap the top. Un-premultiplying (rgb/alpha in main()) amplifies the
+	// stored buffer's per-channel rounding error by 1/alpha, and at a
+	// low-alpha edge (anti-aliased UI/particle boundaries, common right where
+	// the cursor overlaps content) that can push color to roughly double a
+	// legitimate value or more. Once color exceeds ~1.0088 (c2/c3), denom
+	// goes negative and the final pow(num/denom, inv_m1) is pow() of a
+	// negative base with a non-integer exponent -- undefined, NaN on RADV.
+	// Clamping to <= 1 (the whole valid PQ codeword range anyway) keeps denom
+	// bounded away from zero (>= c2-c3 ~= 0.164) for every input.
+	color = clamp(color, vec3(0), vec3(1));
 	float inv_m1 = 1 / 0.1593017578125;
 	float inv_m2 = 1 / 78.84375;
 	float c1 = 0.8359375;
