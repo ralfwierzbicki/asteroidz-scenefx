@@ -911,6 +911,19 @@ void wlr_scene_buffer_set_color_encoding(struct wlr_scene_buffer *scene_buffer,
 void wlr_scene_buffer_set_color_range(struct wlr_scene_buffer *scene_buffer,
 	enum wlr_color_range range);
 
+struct wlr_image_description_v1_data;
+
+/**
+ * scenefx: register a fallback that supplies an image description for
+ * surfaces carrying none via wp-color-management (e.g. clients declaring
+ * colorimetry through frog-color-management). Consulted on every scene
+ * surface reconfigure; the returned pointer must stay valid until the next
+ * call for the same surface. Pass NULL to unregister.
+ */
+void wlr_scene_set_surface_color_description_fallback(
+	const struct wlr_image_description_v1_data *(*cb)(
+		struct wlr_surface *surface));
+
 /**
  * Calls the buffer's frame_done signal.
  */
