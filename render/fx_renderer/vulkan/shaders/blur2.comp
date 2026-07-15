@@ -37,22 +37,6 @@ layout(push_constant) uniform UBO {
 	uvec2 offset;
 } data;
 
-mat4 brightnessMatrix() {
-	float b = data.brightness - 1.0;
-	return mat4(1, 0, 0, 0,
-				0, 1, 0, 0,
-				0, 0, 1, 0,
-				b, b, b, 1);
-}
-
-mat4 contrastMatrix() {
-	float t = (1.0 - data.contrast) / 2.0;
-	return mat4(data.contrast, 0, 0, 0,
-				0, data.contrast, 0, 0,
-				0, 0, data.contrast, 0,
-				t, t, t, 1);
-}
-
 vec3 linear_to_oklab(vec3 c) {
 	float l = dot(vec3(0.4122214708, 0.5363325363, 0.0514459929), c);
 	float m = dot(vec3(0.2119034982, 0.6806995451, 0.1073969566), c);
@@ -99,17 +83,19 @@ vec4 apply_blur_effects(vec4 color, vec2 p) {
 		lab.yz *= data.saturation;
 		rgb = max(oklab_to_linear(lab), vec3(0.0));
 	}
+	// HDR-safe brightness/contrast: multiplicative forms of the classic
+	// affine matrix controls. Any constant offset in the affine map lifts or
+	// crushes blacks -- invisible in 8-bit SDR, but HDR PQ gives the darks
+	// enough perceptual resolution to show absolute offsets as a glow/dark
+	// band over dark blur content (e.g. a popup's blur under a dark bar).
+	// Power-law contrast around the 0.5 pivot and pure-gain brightness keep
+	// black exactly black and scale everything else by RATIO, which PQ
+	// renders as a uniform tint; noise is ratio-scaled for the same reason.
 	rgb = pow(max(rgb, vec3(0.0)), vec3(1.0 / 2.2));
-	vec4 c4 = brightnessMatrix() * contrastMatrix() * vec4(rgb, 1.0);
-	// Pin black: the affine brightness/contrast map has a constant offset
-	// f(0) = (brightness-1) + (1-contrast)/2 that lifts or crushes blacks.
-	// SDR 8-bit hides it; HDR PQ encoding amplifies it into a visible glow
-	// or dark band over dark blur content (popup over a dark bar). Fade the
-	// offset out quadratically toward black so the configured curve is kept
-	// through the mids and at white while f(0) stays exactly 0.
-	float fx_f0 = (data.brightness - 1.0) + (1.0 - data.contrast) * 0.5;
-	vec3 fx_fall = vec3(1.0) - clamp(rgb, vec3(0.0), vec3(1.0));
-	rgb = max(c4.rgb - fx_f0 * fx_fall * fx_fall, vec3(0.0)) + vec3(noiseAmount(p));
+	if (data.contrast != 1.0) {
+		rgb = 0.5 * pow(rgb * 2.0, vec3(data.contrast));
+	}
+	rgb *= data.brightness * (1.0 + noiseAmount(p));
 	rgb = pow(max(rgb, vec3(0.0)), vec3(2.2));
 	return vec4(rgb * a, a);
 }
