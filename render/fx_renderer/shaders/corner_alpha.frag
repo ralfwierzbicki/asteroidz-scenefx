@@ -1,6 +1,9 @@
 // fwidth() for derivative-scaled AA below (ported from the Vulkan renderer's
-// fix, scenefx 744fade).
-#extension GL_OES_standard_derivatives : enable
+// fix, scenefx 744fade). The extension is enabled globally for every
+// fragment shader in compile_shader() (shaders.c) since this file gets
+// concatenated after other shader text at several call sites, and
+// #extension must precede all code in the whole compilation unit -- it
+// can't just go here.
 
 float get_dist(vec2 q, float radius) {
 	return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;

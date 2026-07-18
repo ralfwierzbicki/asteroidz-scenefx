@@ -24,7 +24,23 @@
 
 GLuint compile_shader(GLuint type, const GLchar *src) {
 	GLuint shader = glCreateShader(type);
-	glShaderSource(shader, 1, &src, NULL);
+	if (type == GL_FRAGMENT_SHADER) {
+		// #extension directives must precede all non-preprocessor code in
+		// the compilation unit -- but corner_alpha_frag_src (which needs
+		// GL_OES_standard_derivatives for fwidth()) is concatenated AFTER
+		// other shader text at several call sites in this file, putting it
+		// "in the middle" and failing to compile. Passing it as its own
+		// leading string via glShaderSource (which the GLSL spec treats as
+		// simple concatenation, same as one string) puts it first
+		// unconditionally, for every fragment shader -- harmless for
+		// shaders that don't use it.
+		static const GLchar *ext_preamble =
+			"#extension GL_OES_standard_derivatives : enable\n";
+		const GLchar *srcs[2] = { ext_preamble, src };
+		glShaderSource(shader, 2, srcs, NULL);
+	} else {
+		glShaderSource(shader, 1, &src, NULL);
+	}
 	glCompileShader(shader);
 
 	GLint ok;
