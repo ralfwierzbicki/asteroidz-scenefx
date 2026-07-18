@@ -1,3 +1,7 @@
+// fwidth() for derivative-scaled AA below (ported from the Vulkan renderer's
+// fix, scenefx 744fade).
+#extension GL_OES_standard_derivatives : enable
+
 float get_dist(vec2 q, float radius) {
 	return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
 }
@@ -52,6 +56,11 @@ float corner_alpha(vec2 size, vec2 position, bool is_cutout,
 		max(get_dist(bottom_left, radius_bl), get_dist(bottom_right, radius_br))
 	);
 
-	float result = smoothstep(0.0, 1.0, dist);
+	// Derivative-scaled anti-aliasing: ~1 device pixel of smoothing however
+	// the box is scaled (output scale, overview thumbnails), instead of a
+	// fixed 1 layout-unit band (ported from the Vulkan renderer's fix,
+	// scenefx 744fade).
+	float aa = max(fwidth(dist), 1e-4);
+	float result = smoothstep(0.0, aa, dist);
 	return is_cutout ? result : 1.0 - result;
 }

@@ -416,8 +416,12 @@ static bool fx_renderer_ensure_lut3d(struct fx_renderer *renderer,
 		glGenTextures(1, &renderer->lut3d_tex);
 	}
 	glBindTexture(GL_TEXTURE_3D_OES, renderer->lut3d_tex);
-	glTexParameteri(GL_TEXTURE_3D_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_3D_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	// NEAREST, not LINEAR: color_transform.frag does its own tetrahedral
+	// interpolation (ported from the Vulkan renderer) and needs exact,
+	// unfiltered texel reads at texel-center coordinates to do it -- GLSL
+	// ES 1.00 has no texelFetch to bypass filtering directly.
+	glTexParameteri(GL_TEXTURE_3D_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_3D_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_3D_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D_OES, GL_TEXTURE_WRAP_R_OES, GL_CLAMP_TO_EDGE);
