@@ -1156,6 +1156,25 @@ void wlr_scene_blur_set_size(struct wlr_scene_blur *blur, int width, int height)
 		return;
 	}
 
+	/* On a shrink, the region the blur used to (but no longer will) cover
+	 * never gets damaged by the scene_node_update() call below: that call
+	 * derives damage from scene_node_bounds(), which reads the node's
+	 * CURRENT size — and by the time it runs, width/height have already
+	 * been updated to the new, smaller values. So the old, now-uncovered
+	 * area is never told to repaint, and whatever was composited there
+	 * (blurred background) lingers until something unrelated damages that
+	 * region (e.g. the surface being destroyed) — visible as a stale
+	 * blurred rectangle when e.g. a popup shrinks in place. Explicitly
+	 * damage the OLD bounds first, before changing the size, independent of
+	 * the node's (now stale) visibility. */
+	int x, y;
+	if (wlr_scene_node_coords(&blur->node, &x, &y)) {
+		pixman_region32_t old_bounds;
+		pixman_region32_init_rect(&old_bounds, x, y, blur->width, blur->height);
+		scene_damage_outputs(scene_node_get_root(&blur->node), &old_bounds);
+		pixman_region32_fini(&old_bounds);
+	}
+
 	blur->width = width;
 	blur->height = height;
 
@@ -1642,6 +1661,26 @@ void wlr_scene_buffer_set_dest_size(struct wlr_scene_buffer *scene_buffer,
 	}
 
 	assert(width >= 0 && height >= 0);
+
+	/* Same issue as wlr_scene_blur_set_size: on a shrink, the region this
+	 * node used to (but no longer will) cover never gets damaged —
+	 * scene_node_update() below derives damage from scene_node_bounds(),
+	 * which reads the node's CURRENT size, and dst_width/height have
+	 * already been updated to the new, smaller values by the time it runs.
+	 * This runs on every surface commit (surface.c's surface_reconfigure),
+	 * so any surface/layer-surface shrinking in place — not just blurred
+	 * ones — leaves stale compositor-side content in the now-uncovered
+	 * area until something else damages that region. Explicitly damage the
+	 * OLD bounds first, independent of visibility. */
+	int x, y;
+	if (wlr_scene_node_coords(&scene_buffer->node, &x, &y)) {
+		pixman_region32_t old_bounds;
+		pixman_region32_init_rect(&old_bounds, x, y,
+			scene_buffer->dst_width, scene_buffer->dst_height);
+		scene_damage_outputs(scene_node_get_root(&scene_buffer->node), &old_bounds);
+		pixman_region32_fini(&old_bounds);
+	}
+
 	scene_buffer->dst_width = width;
 	scene_buffer->dst_height = height;
 	scene_node_update(&scene_buffer->node, NULL);
