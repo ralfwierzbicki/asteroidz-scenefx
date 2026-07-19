@@ -296,6 +296,7 @@ bool link_tex_program(struct tex_shader *shader, enum fx_tex_shader_source sourc
 	shader->transfer_function = glGetUniformLocation(prog, "transfer_function");
 	shader->luminance_multiplier = glGetUniformLocation(prog, "luminance_multiplier");
 	shader->color_matrix = glGetUniformLocation(prog, "color_matrix");
+	shader->content_peak = glGetUniformLocation(prog, "content_peak");
 
 	if (!effects) {
 		return true;

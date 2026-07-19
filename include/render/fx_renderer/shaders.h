@@ -127,6 +127,7 @@ struct tex_shader {
 	GLint transfer_function;
 	GLint luminance_multiplier;
 	GLint color_matrix;
+	GLint content_peak;
 
 	// Only used for the effects shader
 	struct {

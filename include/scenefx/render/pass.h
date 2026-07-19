@@ -70,6 +70,11 @@ struct fx_render_texture_options {
 	// Alpha at or below which pixels are discarded when
 	// discard_transparent is set (0 = only fully transparent)
 	float discard_alpha_threshold;
+	// Highlight-rolloff ceiling for source color management, in the same
+	// reference-normalized units as base.luminance_multiplier (1.0 ==
+	// reference nits). Only meaningful when base.transfer_function != 0;
+	// ignored otherwise.
+	float content_peak;
 };
 
 struct fx_render_rect_options {

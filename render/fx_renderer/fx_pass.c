@@ -688,6 +688,11 @@ void fx_render_pass_add_texture(struct fx_gles_render_pass *pass,
 	float luminance_multiplier = options->luminance_multiplier != NULL
 		? *options->luminance_multiplier : 1.0f;
 	glUniform1f(shader->luminance_multiplier, luminance_multiplier);
+	// content_peak is only read by the shader when transfer_function != 0;
+	// guard the fallback so the shader never divides by zero on paths that
+	// don't populate it (e.g. non-scene render-pass callers).
+	glUniform1f(shader->content_peak,
+		fx_options->content_peak > 0 ? fx_options->content_peak : 1.0f);
 	float color_matrix[9] = {
 		1, 0, 0,
 		0, 1, 0,

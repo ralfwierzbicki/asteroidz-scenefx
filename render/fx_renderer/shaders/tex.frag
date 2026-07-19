@@ -65,10 +65,12 @@ uniform float discard_threshold;
 // colorimetry, in which case this is a single int compare and nothing
 // else runs -- zero behavior/perf change for existing content.
 //
-// HDR highlights above 1.0 after the luminance scale get hard-clipped
-// before the gamma22 re-encode ("clip" tone mapping, not real display-
-// referred tone mapping) -- a deliberate simplification: correct color and
-// no blown-out artifacts, not preserved highlight detail.
+// HDR highlights above 1.0 after the luminance scale get compressed via a
+// simple per-channel Reinhard-extended rolloff (see content_peak) before the
+// gamma22 re-encode, instead of a hard clip -- highlight detail up to the
+// content's own declared peak survives, at the cost of per-channel (not
+// hue-preserving) compression, matching this renderer's narrower color-
+// management scope rather than a full display-referred tone mapper.
 //
 // Values match enum wlr_color_transfer_function (render/color.h) exactly
 // -- bit flags, not sequential, so comparing the raw uniform int against
@@ -83,6 +85,11 @@ uniform float discard_threshold;
 uniform int transfer_function;
 uniform float luminance_multiplier;
 uniform mat3 color_matrix;
+// Highlight-rolloff ceiling, in the same reference-normalized units as
+// luminance_multiplier (1.0 == reference/SDR-white nits): the content's own
+// declared HDR10 MaxCLL when known, else the transfer function's own
+// absolute peak. See the rolloff in apply_source_color_management.
+uniform float content_peak;
 
 float srgb_channel_to_linear(float x) {
 	return mix(x / 12.92, pow((x + 0.055) / 1.055, 2.4), step(0.04045, x));
@@ -155,8 +162,22 @@ vec4 apply_source_color_management(vec4 color) {
 	// (M * v) written the other way around, not a different result.
 	rgb = rgb * color_matrix;
 
-	// re-encode to this pipeline's assumed gamma-2.2-ish working space
+	// Highlight rolloff (Extended Reinhard, per-channel) instead of a hard
+	// clip at 1.0: L=0 stays exact, L=content_peak maps to exactly 1.0,
+	// and everything beyond compresses asymptotically toward 1.0 rather
+	// than crushing flat white the instant a pixel exceeds the reference
+	// white level. This is a simple/naive per-channel operator (it can
+	// shift hue/saturation at extreme brightness since R, G, B aren't
+	// compressed by a shared luminance-derived factor) -- deliberately not
+	// a full luminance-preserving tone mapper, matching this renderer's
+	// narrower color-management scope (see apply_source_color_management's
+	// own header comment).
+	vec3 l = max(rgb, vec3(0.0));
+	vec3 peak2 = vec3(content_peak * content_peak);
+	rgb = l * (vec3(1.0) + l / peak2) / (vec3(1.0) + l);
 	rgb = clamp(rgb, vec3(0.0), vec3(1.0));
+
+	// re-encode to this pipeline's assumed gamma-2.2-ish working space
 	rgb = pow(rgb, vec3(1.0 / 2.2));
 
 	// back to premultiplied

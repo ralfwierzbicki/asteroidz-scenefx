@@ -308,9 +308,18 @@ static void surface_reconfigure(struct wlr_scene_surface *scene_surface) {
 	if (img_desc == NULL && scene_surface_color_fallback != NULL) {
 		img_desc = scene_surface_color_fallback(surface);
 	}
+	// max_cll is a scenefx-specific addition on top of this otherwise exact
+	// wlroots 0.20.2 copy of surface_reconfigure: forwarded to the scene
+	// buffer for the composited-render tone-mapping rolloff (see
+	// wlr_scene.c's content_peak), 0 (unset) for anything that isn't
+	// declaring PQ colorimetry.
+	uint32_t max_cll = 0;
 	if (img_desc != NULL) {
 		tf = wlr_color_manager_v1_transfer_function_to_wlr(img_desc->tf_named);
 		primaries = wlr_color_manager_v1_primaries_to_wlr(img_desc->primaries_named);
+		if (tf == WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ) {
+			max_cll = img_desc->max_cll;
+		}
 	}
 
 	enum wlr_color_encoding color_encoding = WLR_COLOR_ENCODING_NONE;
@@ -335,6 +344,7 @@ static void surface_reconfigure(struct wlr_scene_surface *scene_surface) {
 	wlr_scene_buffer_set_primaries(scene_buffer, primaries);
 	wlr_scene_buffer_set_color_encoding(scene_buffer, color_encoding);
 	wlr_scene_buffer_set_color_range(scene_buffer, color_range);
+	wlr_scene_buffer_set_max_cll(scene_buffer, max_cll);
 
 	scene_buffer_unmark_client_buffer(scene_buffer);
 

@@ -1763,6 +1763,16 @@ void wlr_scene_buffer_set_primaries(struct wlr_scene_buffer *scene_buffer,
 	scene_node_update(&scene_buffer->node, NULL);
 }
 
+void wlr_scene_buffer_set_max_cll(struct wlr_scene_buffer *scene_buffer,
+		uint32_t max_cll) {
+	if (scene_buffer->max_cll == max_cll) {
+		return;
+	}
+
+	scene_buffer->max_cll = max_cll;
+	scene_node_update(&scene_buffer->node, NULL);
+}
+
 void wlr_scene_buffer_set_color_encoding(struct wlr_scene_buffer *scene_buffer,
 		enum wlr_color_encoding color_encoding) {
 	if (scene_buffer->color_encoding == color_encoding) {
@@ -2416,6 +2426,17 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 		}
 		float luminance_multiplier = get_luminance_multiplier(&src_lum, &srgb_lum);
 
+		// Tone-mapping ceiling for the shader's highlight rolloff, in the
+		// same reference-normalized units luminance_multiplier already
+		// produces (1.0 == src_lum.reference nits): the content's own
+		// declared MaxCLL when known, else the transfer function's own
+		// absolute peak (src_lum.max) -- which is exactly what the rolloff
+		// degenerates to when no content metadata was ever set, so this is
+		// a strict improvement over a hard clip, never a behavior change
+		// for content that doesn't declare MaxCLL.
+		float content_peak = (scene_buffer->max_cll > 0 ?
+			(float)scene_buffer->max_cll : src_lum.max) / src_lum.reference;
+
 		struct fx_render_texture_options tex_options = {
 			.base = (struct wlr_render_texture_options){
 				.texture = texture,
@@ -2439,6 +2460,7 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 			.clip_box = &dst_box,
 			.corners = fx_corner_radii_scale(buffer_corners, data->scale),
 			.clipped_region = {0},
+			.content_peak = content_peak,
 		};
 
 		// TODO: Use the base wlr_render_pass_add_texture as a fast-path in the future

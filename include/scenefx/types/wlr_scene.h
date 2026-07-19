@@ -281,6 +281,11 @@ struct wlr_scene_buffer {
 	enum wlr_color_named_primaries primaries;
 	enum wlr_color_encoding color_encoding;
 	enum wlr_color_range color_range;
+	// Content's own declared HDR10 MaxCLL in cd/m^2 (frog-color-management-v1
+	// / wp-color-management's set_hdr_metadata), 0 if unset. Used as the
+	// composited-render tone-mapping ceiling instead of transfer_function's
+	// own absolute peak -- see get_luminance_multiplier's caller.
+	uint32_t max_cll;
 
 	// When true, this buffer is never a direct-scanout candidate: it
 	// always goes through the compositing render pass, even when it's the
@@ -935,6 +940,9 @@ void wlr_scene_buffer_set_transfer_function(struct wlr_scene_buffer *scene_buffe
 
 void wlr_scene_buffer_set_primaries(struct wlr_scene_buffer *scene_buffer,
 	enum wlr_color_named_primaries primaries);
+
+void wlr_scene_buffer_set_max_cll(struct wlr_scene_buffer *scene_buffer,
+	uint32_t max_cll);
 
 void wlr_scene_buffer_set_color_encoding(struct wlr_scene_buffer *scene_buffer,
 	enum wlr_color_encoding encoding);
