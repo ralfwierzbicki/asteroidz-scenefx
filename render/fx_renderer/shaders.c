@@ -288,6 +288,10 @@ bool link_tex_program(struct tex_shader *shader, enum fx_tex_shader_source sourc
 	shader->discard_transparent = glGetUniformLocation(prog, "discard_transparent");
 	shader->discard_threshold = glGetUniformLocation(prog, "discard_threshold");
 
+	shader->transfer_function = glGetUniformLocation(prog, "transfer_function");
+	shader->luminance_multiplier = glGetUniformLocation(prog, "luminance_multiplier");
+	shader->color_matrix = glGetUniformLocation(prog, "color_matrix");
+
 	if (!effects) {
 		return true;
 	}

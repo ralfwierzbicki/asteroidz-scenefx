@@ -678,6 +678,29 @@ void fx_render_pass_add_texture(struct fx_gles_render_pass *pass,
 	glUniform1f(shader->discard_transparent, fx_options->discard_transparent);
 	glUniform1f(shader->discard_threshold, fx_options->discard_alpha_threshold);
 
+	/* per-surface source color management (frog-color-management-v1 /
+	 * wp-color-management) -- see tex.frag's apply_source_color_management
+	 * for why this re-encodes to gamma22 instead of staying linear like
+	 * the Vulkan renderer's equivalent pass. transfer_function is 0 (no
+	 * bit set) for the overwhelming majority of surfaces that never
+	 * declared any colorimetry. */
+	glUniform1i(shader->transfer_function, (GLint)options->transfer_function);
+	float luminance_multiplier = options->luminance_multiplier != NULL
+		? *options->luminance_multiplier : 1.0f;
+	glUniform1f(shader->luminance_multiplier, luminance_multiplier);
+	float color_matrix[9] = {
+		1, 0, 0,
+		0, 1, 0,
+		0, 0, 1,
+	};
+	if (options->primaries != NULL) {
+		struct wlr_color_primaries srgb;
+		wlr_color_primaries_from_named(&srgb, WLR_COLOR_NAMED_PRIMARIES_SRGB);
+		wlr_color_primaries_transform_absolute_colorimetric(options->primaries,
+			&srgb, color_matrix);
+	}
+	glUniformMatrix3fv(shader->color_matrix, 1, GL_FALSE, color_matrix);
+
 	if (use_effects) {
 		struct fx_corner_fradii corners = fx_options->corners;
 

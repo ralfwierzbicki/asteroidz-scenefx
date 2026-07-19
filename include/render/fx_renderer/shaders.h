@@ -122,6 +122,12 @@ struct tex_shader {
 	GLint discard_transparent;
 	GLint discard_threshold;
 
+	// Per-surface source color management (frog-color-management-v1 /
+	// wp-color-management); see tex.frag's apply_source_color_management
+	GLint transfer_function;
+	GLint luminance_multiplier;
+	GLint color_matrix;
+
 	// Only used for the effects shader
 	struct {
 		GLint size;
