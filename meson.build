@@ -3,7 +3,7 @@ project(
 	'c',
 	version: '0.17.1',
 	license: 'MIT',
-	meson_version: '0.17.1',
+	meson_version: '>=1.3',
 	default_options: [
 		'c_std=' + (meson.version().version_compare('>=1.4.0') ? 'c23,c11' : 'c11'),
 		'warning_level=2',
@@ -105,7 +105,7 @@ endif
 
 
 drm = dependency('libdrm',
-	version: '0.17.1',
+	version: '>=2.4.129',
 	fallback: 'libdrm',
 	default_options: [
 		'auto_features=disabled',
@@ -113,7 +113,7 @@ drm = dependency('libdrm',
 	],
 )
 xkbcommon = dependency('xkbcommon',
-	version: '0.17.1',
+	version: '>=1.8.0',
 	fallback: 'libxkbcommon',
 	default_options: [
 		'enable-tools=false',
@@ -123,7 +123,7 @@ xkbcommon = dependency('xkbcommon',
 	],
 )
 pixman = dependency('pixman-1',
-	version: '0.17.1',
+	version: '>=0.43.0',
 	fallback: 'pixman',
 	default_options: ['werror=false'],
 )
