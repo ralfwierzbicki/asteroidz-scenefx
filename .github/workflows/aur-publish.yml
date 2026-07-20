@@ -1,0 +1,44 @@
+name: aur-publish
+
+on:
+  release:
+    types: [published]
+
+# pushing the version-bumped PKGBUILD back to this repo needs write access;
+# the default GITHUB_TOKEN is read-only for that on some repo settings.
+permissions:
+  contents: write
+
+jobs:
+  aur-publish:
+    name: Publish asteroidz-scenefx to the AUR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump PKGBUILD to the release version
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+
+      - name: Commit bumped PKGBUILD back to the repo
+        run: |
+          git config user.name "asteroidzman"
+          git config user.email "asteroidzman@users.noreply.github.com"
+          git add PKGBUILD
+          git diff --cached --quiet || git commit -m "PKGBUILD: bump to ${{ github.event.release.tag_name }}"
+          git push origin HEAD:${{ github.event.repository.default_branch }}
+
+      - name: Publish to the AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4
+        with:
+          pkgname: asteroidz-scenefx
+          pkgbuild: ./PKGBUILD
+          commit_username: asteroidzman
+          commit_email: asteroidzman@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: Update to ${{ github.event.release.tag_name }}
+          ssh_keyscan_types: rsa,ecdsa,ed25519
+          test: true

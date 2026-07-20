@@ -12,7 +12,7 @@ provides=('asteroidz-scenefx' 'libasteroidz-scenefx-0.5.so')
 conflicts=('asteroidz-scenefx')
 # Renamed fork: installs as libasteroidz-scenefx-0.5 / asteroidz-scenefx-0.5.pc,
 # so it does NOT conflict with an upstream `scenefx` package.
-source=("git+$url.git")
+source=("git+$url.git#tag=$pkgver")
 sha256sums=('SKIP')
 
 build() {
