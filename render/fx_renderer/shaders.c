@@ -130,7 +130,7 @@ void uniform_corner_radii_set(const struct shader_corner_radii *uniform,
 
 bool link_quad_program(struct quad_shader *shader, bool clip) {
 	GLchar quad_src_part[2048];
-	GLchar quad_src[4096];
+	GLchar quad_src[8192];
 	snprintf(quad_src_part, sizeof(quad_src_part),
 		quad_frag_src, clip);
 	snprintf(quad_src, sizeof(quad_src),
@@ -161,7 +161,7 @@ bool link_quad_program(struct quad_shader *shader, bool clip) {
 
 bool link_quad_grad_program(struct quad_grad_shader *shader, int max_len) {
 	GLchar quad_src_part[2048];
-	GLchar quad_src[4096];
+	GLchar quad_src[8192];
 	snprintf(quad_src_part, sizeof(quad_src_part),
 		quad_grad_frag_src, max_len);
 	snprintf(quad_src, sizeof(quad_src),
@@ -190,7 +190,7 @@ bool link_quad_grad_program(struct quad_grad_shader *shader, int max_len) {
 }
 
 bool link_quad_round_program(struct quad_round_shader *shader) {
-	GLchar quad_src[4096];
+	GLchar quad_src[8192];
 	snprintf(quad_src, sizeof(quad_src), "%s\n%s", quad_round_frag_src,
 		corner_alpha_frag_src);
 
