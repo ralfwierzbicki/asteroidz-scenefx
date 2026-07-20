@@ -12,10 +12,18 @@ project(
 	],
 )
 
-version = meson.project_version().split('-')[0]
-version_major = version.split('.')[0]
-version_minor = version.split('.')[1]
-versioned_name = '@0@-@1@.@2@'.format(meson.project_name(), version_major, version_minor)
+# abi_version is the library/pkg-config name's own stable version marker
+# (like wlroots-0.20's "-0.20") -- deliberately NOT meson.project_version(),
+# which now mirrors asteroidz's release tag and moves with every asteroidz
+# release regardless of whether this library's ABI actually changed.
+# asteroidz's own meson.build hardcodes dependency('asteroidz-scenefx-0.5',
+# ...); letting versioned_name drift with an unrelated release cadence broke
+# that lookup entirely the first time this was tried (confirmed: a fresh
+# asteroidz build couldn't find asteroidz-scenefx-0.5 once this became
+# asteroidz-scenefx-0.17). Bump abi_version by hand only on an actual
+# ABI-relevant change, same as any versioned C library.
+abi_version = '0.5'
+versioned_name = '@0@-@1@'.format(meson.project_name(), abi_version)
 
 little_endian = target_machine.endian() == 'little'
 big_endian = target_machine.endian() == 'big'
