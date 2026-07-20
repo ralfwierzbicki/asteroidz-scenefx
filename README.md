@@ -51,9 +51,9 @@ This fork is renamed **asteroidz-scenefx** to avoid clashing with an
 upstream `scenefx`: it installs as `libasteroidz-scenefx-0.5` /
 `asteroidz-scenefx-0.5.pc`, and asteroidz depends on it as
 `asteroidz-scenefx-0.5`. Build with `-Drenderers=gles2,vulkan` so both
-renderers are available (asteroidz defaults to Vulkan, with GLES2 as a
-fallback session). Install with `--prefix=/usr` so it lands beside the
-system `wlroots0.20`.
+renderers are available (asteroidz defaults to GLES2 — the stable, daily
+driver — with an experimental Vulkan session also installed). Install
+with `--prefix=/usr` so it lands beside the system `wlroots0.20`.
 
 ### Arch Linux
 
