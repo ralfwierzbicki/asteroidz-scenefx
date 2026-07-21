@@ -2428,14 +2428,46 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 
 		// Tone-mapping ceiling for the shader's highlight rolloff, in the
 		// same reference-normalized units luminance_multiplier already
-		// produces (1.0 == src_lum.reference nits): the content's own
-		// declared MaxCLL when known, else the transfer function's own
-		// absolute peak (src_lum.max) -- which is exactly what the rolloff
-		// degenerates to when no content metadata was ever set, so this is
-		// a strict improvement over a hard clip, never a behavior change
-		// for content that doesn't declare MaxCLL.
-		float content_peak = (scene_buffer->max_cll > 0 ?
-			(float)scene_buffer->max_cll : src_lum.max) / src_lum.reference;
+		// produces (1.0 == src_lum.reference nits).
+		//
+		// Preference order: the content's own declared MaxCLL, then the
+		// OUTPUT's declared peak, then the transfer function's absolute peak.
+		//
+		// The output fallback is what makes this useful in practice. A client
+		// can only declare MaxCLL through wp-color-management-v1's
+		// set_luminances, and wlroots does not implement that request -- it
+		// rejects it with "set_luminances is not supported", and asserts if a
+		// compositor even tries to advertise the feature (see
+		// types/wlr_color_management_v1.c). So scene_buffer->max_cll is always
+		// 0 here and the first branch is unreachable on this stack.
+		//
+		// That left every PQ surface rolling off against src_lum.max, which
+		// for ST.2084 is its full 10000-nit signal range, on panels peaking
+		// two orders of magnitude lower. The rolloff then compresses the whole
+		// image toward the reference level and HDR content renders washed out
+		// and desaturated -- worst on exactly the well-behaved content that
+		// stays inside its declared mastering volume. The output's own
+		// MaxCLL/mastering peak is the number the rolloff wants whenever the
+		// content itself has no way to say.
+		//
+		// Restricted to PQ deliberately: PQ is absolute, so the output's peak
+		// is directly comparable to the content's. Relative (SDR) buffers
+		// already get a sane src_lum.max and must keep their existing
+		// reference-white behaviour.
+		float content_peak_nits = src_lum.max;
+		if (scene_buffer->max_cll > 0) {
+			content_peak_nits = (float)scene_buffer->max_cll;
+		} else if (scene_buffer->transfer_function ==
+				WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ) {
+			const struct wlr_output_image_description *out_desc =
+				data->output->output->image_description;
+			if (out_desc != NULL && out_desc->max_cll > 0) {
+				content_peak_nits = (float)out_desc->max_cll;
+			} else if (out_desc != NULL && out_desc->mastering_luminance.max > 0) {
+				content_peak_nits = (float)out_desc->mastering_luminance.max;
+			}
+		}
+		float content_peak = content_peak_nits / src_lum.reference;
 
 		struct fx_render_texture_options tex_options = {
 			.base = (struct wlr_render_texture_options){
