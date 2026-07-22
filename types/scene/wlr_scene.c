@@ -3858,8 +3858,25 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 	if (fx_pass != NULL) {
 		fx_render_pass_set_color_resolve_damage(render_pass, &render_data.damage);
 	}
+	// Only allocate the (large, persistent) per-output offscreen blur buffers
+	// when something this frame will actually use them: a blur node in the
+	// render list with blur enabled, or the zoom overlay (which stages the
+	// frame in blur_saved_pixels_buffer).
+	bool gles_needs_blur = zoom_active;
+	if (fx_pass != NULL && !gles_needs_blur &&
+			is_scene_blur_enabled(&scene_output->scene->blur_data)) {
+		for (int i = 0; i < list_len; i++) {
+			enum wlr_scene_node_type node_type = list_data[i].node->type;
+			if (node_type == WLR_SCENE_NODE_BLUR ||
+					node_type == WLR_SCENE_NODE_OPTIMIZED_BLUR) {
+				gles_needs_blur = true;
+				break;
+			}
+		}
+	}
 	bool should_compensate_blur = false;
-	if (fx_pass != NULL && fx_render_pass_init_offscreen_buffers(render_pass, output)
+	if (fx_pass != NULL &&
+			fx_render_pass_init_offscreen_buffers(render_pass, output, gles_needs_blur)
 			&& pixman_region32_not_empty(&render_data.damage)) {
 		// Blur artifact prevention
 		// Note: Supports individual blur node blur_data
@@ -4091,7 +4108,8 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 				fx_pass->buffer, fx_pass->fx_offscreen_buffers->blur_saved_pixels_buffer);
 	}
 
-	if (zoom_active && fx_pass != NULL && fx_pass->fx_offscreen_buffers != NULL) {
+	if (zoom_active && fx_pass != NULL && fx_pass->fx_offscreen_buffers != NULL &&
+			fx_pass->fx_offscreen_buffers->blur_saved_pixels_buffer != NULL) {
 		scene_output_render_zoom(scene_output, fx_pass, &render_data);
 	}
 

@@ -132,10 +132,13 @@ struct fx_gles_render_pass *fx_get_render_pass(struct wlr_render_pass *render_pa
 
 /**
  * Initializes the render pass offscreen buffers required for advanced effects
- * like blur.
+ * like blur. Pass needs_blur = true when a blur node will render this frame:
+ * the (large, per-output) blur buffer set is only allocated then. With
+ * needs_blur = false only the color-transform buffer (if any) is set up.
+ * Returns true when the blur buffers are ready for this pass.
  */
 bool fx_render_pass_init_offscreen_buffers(struct wlr_render_pass *render_pass,
-		struct wlr_output *output);
+		struct wlr_output *output, bool needs_blur);
 
 /**
  * Render a fx texture.

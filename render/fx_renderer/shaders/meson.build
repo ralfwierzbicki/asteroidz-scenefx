@@ -14,7 +14,6 @@ shaders = [
 	'box_shadow.frag',
 	'blur1.frag',
 	'blur2.frag',
-	'blur_effects.frag',
 	'color_transform.frag',
 ]
 

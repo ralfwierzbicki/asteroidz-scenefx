@@ -102,6 +102,13 @@ static bool fx_texture_update_from_buffer(struct wlr_texture *wlr_texture,
 void fx_texture_destroy(struct fx_texture *texture) {
 	wl_list_remove(&texture->link);
 	if (texture->buffer != NULL) {
+		// If this wrapper is the framebuffer's cached sampling texture,
+		// unhook it so no dangling pointer survives -- this makes the
+		// renderer-teardown order (textures before offscreen buffers) and
+		// explicit fx_framebuffer_release_cached_texture both safe.
+		if (texture->buffer->cached_texture == &texture->wlr_texture) {
+			texture->buffer->cached_texture = NULL;
+		}
 		wlr_buffer_unlock(texture->buffer->buffer);
 	} else {
 		struct wlr_egl_context prev_ctx;

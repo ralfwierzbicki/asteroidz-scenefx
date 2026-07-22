@@ -21,7 +21,6 @@
 #include "color_transform_frag_src.h"
 #include "blur1_frag_src.h"
 #include "blur2_frag_src.h"
-#include "blur_effects_frag_src.h"
 
 GLuint compile_shader(GLuint type, const GLchar *src) {
 	GLuint shader = glCreateShader(type);
@@ -411,6 +410,11 @@ bool link_blur1_program(struct blur_shader *shader) {
 	shader->tex_proj = glGetUniformLocation(prog, "tex_proj");
 	shader->radius = glGetUniformLocation(prog, "radius");
 	shader->halfpixel = glGetUniformLocation(prog, "halfpixel");
+	shader->apply_effects = -1;
+	shader->noise = -1;
+	shader->brightness = -1;
+	shader->contrast = -1;
+	shader->saturation = -1;
 
 	return true;
 }
@@ -427,20 +431,7 @@ bool link_blur2_program(struct blur_shader *shader) {
 	shader->tex_proj = glGetUniformLocation(prog, "tex_proj");
 	shader->radius = glGetUniformLocation(prog, "radius");
 	shader->halfpixel = glGetUniformLocation(prog, "halfpixel");
-
-	return true;
-}
-
-bool link_blur_effects_program(struct blur_effects_shader *shader) {
-	GLuint prog;
-	shader->program = prog = link_program(blur_effects_frag_src);
-	if (!shader->program) {
-		return false;
-	}
-	shader->proj = glGetUniformLocation(prog, "proj");
-	shader->tex = glGetUniformLocation(prog, "tex");
-	shader->pos_attrib = glGetAttribLocation(prog, "pos");
-	shader->tex_proj = glGetUniformLocation(prog, "tex_proj");
+	shader->apply_effects = glGetUniformLocation(prog, "apply_effects");
 	shader->noise = glGetUniformLocation(prog, "noise");
 	shader->brightness = glGetUniformLocation(prog, "brightness");
 	shader->contrast = glGetUniformLocation(prog, "contrast");

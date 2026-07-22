@@ -305,7 +305,8 @@ struct fx_vk_effect_buffers {
 	struct fx_vk_renderer *renderer;
 	int width, height;
 
-	// Blur ping-pong pair (graphics blur path).
+	// Blur ping-pong pair (graphics blur path). NULL when the compute blur
+	// chain below is fully usable -- then no code path ever samples them.
 	struct fx_vk_effect_image *effects;
 	struct fx_vk_effect_image *effects_swapped;
 	// Mipped blur chain (compute blur path; NULL when compute is unavailable
@@ -314,8 +315,6 @@ struct fx_vk_effect_buffers {
 	// Cached whole-background blur + its unblurred source (for strength<1).
 	struct fx_vk_effect_image *optimized_blur;
 	struct fx_vk_effect_image *optimized_no_blur;
-	// Saved original pixels to repaint blur edge artifacts.
-	struct fx_vk_effect_image *blur_saved_pixels;
 
 	// Whether optimized_blur currently holds a valid cached background blur.
 	// Set once the optimized-blur pass has run for this (persistent) buffer set,

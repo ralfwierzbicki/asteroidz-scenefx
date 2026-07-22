@@ -104,7 +104,9 @@ void fx_framebuffer_get_or_create_custom(struct fx_renderer *renderer,
 				return;
 			}
 			// Create a new wlr_buffer if it's null or if the output size or
-			// format has changed
+			// format has changed. The cached sampling wrapper holds a lock on
+			// the buffer, so it must go first or the drop never frees it.
+			fx_framebuffer_release_cached_texture(*fx_framebuffer);
 			wlr_buffer_drop(wlr_buffer);
 		} else {
 			fx_framebuffer_destroy(*fx_framebuffer);
@@ -187,6 +189,39 @@ error_buffer:
 
 void fx_framebuffer_bind(struct fx_framebuffer *fx_buffer) {
 	glBindFramebuffer(GL_FRAMEBUFFER, fx_framebuffer_get_fbo(fx_buffer));
+}
+
+struct wlr_texture *fx_framebuffer_get_texture(struct fx_framebuffer *buffer) {
+	if (buffer->cached_texture != NULL) {
+		return buffer->cached_texture;
+	}
+	struct wlr_texture *texture = fx_texture_from_buffer(
+		&buffer->renderer->wlr_renderer, buffer->buffer);
+	// Only renderer-owned offscreen buffers (drm_format set, see
+	// fx_framebuffer_get_or_create_custom) keep the wrapper: they are written
+	// exclusively by this GL context, so the external-writer dmabuf re-import
+	// each wrap performs is unnecessary for them. Swapchain buffers must not
+	// be cached -- the wrapper's wlr_buffer lock would mark their slot busy
+	// forever.
+	if (texture != NULL && buffer->drm_format != 0) {
+		buffer->cached_texture = texture;
+	}
+	return texture;
+}
+
+void fx_framebuffer_put_texture(struct fx_framebuffer *buffer,
+		struct wlr_texture *texture) {
+	if (texture != NULL && texture != buffer->cached_texture) {
+		wlr_texture_destroy(texture);
+	}
+}
+
+void fx_framebuffer_release_cached_texture(struct fx_framebuffer *buffer) {
+	if (buffer != NULL && buffer->cached_texture != NULL) {
+		// fx_texture_destroy clears buffer->cached_texture and drops the
+		// wlr_buffer lock the wrapper held
+		wlr_texture_destroy(buffer->cached_texture);
+	}
 }
 
 void fx_framebuffer_destroy(struct fx_framebuffer *fx_buffer) {

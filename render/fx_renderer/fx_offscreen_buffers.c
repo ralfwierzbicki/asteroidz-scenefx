@@ -7,34 +7,26 @@
 #include "scenefx/render/fx_renderer/fx_renderer.h"
 #include "scenefx/render/fx_renderer/fx_offscreen_buffers.h"
 
+// Drop one offscreen buffer: the cached sampling wrapper holds a lock on the
+// wlr_buffer, so it must be released first or the drop never frees anything.
+static void offscreen_buffer_drop(struct fx_framebuffer **buffer) {
+	if (*buffer != NULL) {
+		fx_framebuffer_release_cached_texture(*buffer);
+		wlr_buffer_drop((*buffer)->buffer);
+		*buffer = NULL;
+	}
+}
+
 static void addon_handle_destroy(struct wlr_addon *addon) {
 	struct fx_offscreen_buffers *fbos = wl_container_of(addon, fbos, addon);
 
 	// Make sure to free the buffers
-	if (fbos->optimized_blur_buffer != NULL) {
-		wlr_buffer_drop(fbos->optimized_blur_buffer->buffer);
-		fbos->optimized_blur_buffer = NULL;
-	}
-	if (fbos->optimized_no_blur_buffer != NULL) {
-		wlr_buffer_drop(fbos->optimized_no_blur_buffer->buffer);
-		fbos->optimized_no_blur_buffer = NULL;
-	}
-	if (fbos->blur_saved_pixels_buffer != NULL) {
-		wlr_buffer_drop(fbos->blur_saved_pixels_buffer->buffer);
-		fbos->blur_saved_pixels_buffer = NULL;
-	}
-	if (fbos->color_transform_buffer != NULL) {
-		wlr_buffer_drop(fbos->color_transform_buffer->buffer);
-		fbos->color_transform_buffer = NULL;
-	}
-	if (fbos->effects_buffer != NULL) {
-		wlr_buffer_drop(fbos->effects_buffer->buffer);
-		fbos->effects_buffer = NULL;
-	}
-	if (fbos->effects_buffer_swapped != NULL) {
-		wlr_buffer_drop(fbos->effects_buffer_swapped->buffer);
-		fbos->effects_buffer_swapped = NULL;
-	}
+	offscreen_buffer_drop(&fbos->optimized_blur_buffer);
+	offscreen_buffer_drop(&fbos->optimized_no_blur_buffer);
+	offscreen_buffer_drop(&fbos->blur_saved_pixels_buffer);
+	offscreen_buffer_drop(&fbos->color_transform_buffer);
+	offscreen_buffer_drop(&fbos->effects_buffer);
+	offscreen_buffer_drop(&fbos->effects_buffer_swapped);
 
 	wl_list_remove(&fbos->link);
 	wlr_addon_finish(&fbos->addon);

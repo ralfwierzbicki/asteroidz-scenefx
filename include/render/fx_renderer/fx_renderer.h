@@ -48,6 +48,15 @@ struct fx_framebuffer {
 	GLuint tex;
 	GLuint sb; // Stencil
 
+	// Cached sampling wrapper for renderer-owned offscreen buffers (blur
+	// ping-pong, optimized-blur cache, color transform): re-wrapping per
+	// draw costs a malloc, an eglMakeCurrent save/restore pair and a buffer
+	// lock/unlock -- ~7x per blur node per frame. Holds a wlr_buffer lock,
+	// so it MUST be released (fx_framebuffer_release_texture) before the
+	// buffer is dropped or it keeps the buffer alive forever. Never set for
+	// swapchain buffers: the lock would mark the swapchain slot busy.
+	struct wlr_texture *cached_texture;
+
 	struct wlr_addon addon;
 };
 
@@ -64,6 +73,27 @@ struct fx_framebuffer *fx_framebuffer_get_or_create(struct fx_renderer *renderer
 		struct wlr_buffer *wlr_buffer);
 
 void fx_framebuffer_bind(struct fx_framebuffer *buffer);
+
+/**
+ * Get a wlr_texture sampling this framebuffer. Renderer-owned offscreen
+ * buffers return a persistent cached wrapper; other buffers (swapchain) get
+ * a fresh one. Always release via fx_framebuffer_put_texture.
+ */
+struct wlr_texture *fx_framebuffer_get_texture(struct fx_framebuffer *buffer);
+
+/**
+ * Release a texture obtained from fx_framebuffer_get_texture: destroys it
+ * unless it is the buffer's cached wrapper.
+ */
+void fx_framebuffer_put_texture(struct fx_framebuffer *buffer,
+		struct wlr_texture *texture);
+
+/**
+ * Drop the cached sampling wrapper (and its wlr_buffer lock). MUST be called
+ * before wlr_buffer_drop on a custom offscreen buffer, or the lock keeps the
+ * buffer alive forever.
+ */
+void fx_framebuffer_release_cached_texture(struct fx_framebuffer *buffer);
 
 /**
  * Destroy the fx_framebuffer.
@@ -209,7 +239,6 @@ struct fx_renderer {
 		struct color_transform_shader color_transform;
 		struct blur_shader blur1;
 		struct blur_shader blur2;
-		struct blur_effects_shader blur_effects;
 	} shaders;
 
 	struct wl_list buffers; // fx_framebuffer.link

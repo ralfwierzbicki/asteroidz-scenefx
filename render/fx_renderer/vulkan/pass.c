@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <drm_fourcc.h>
+#include <math.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <wlr/util/log.h>
@@ -800,6 +801,38 @@ static void render_pass_add_rect(struct wlr_render_pass *wlr_pass,
 // Fills the shared rounded-corner push-constant block from an effect box, its
 // corner radii and an interior clip cutout. Radii order matches the shader and
 // GLES uniform_corner_radii_set(): tl, tr, bl, br.
+// Subtract the interior clipped region (minus a corner-radius safety margin)
+// from a CPU clip region, so fragments fully inside the cutout are never
+// rasterized. Port of the GLES fx_pass.c apply_clip_region: the shader's
+// corner_alpha cutout still handles the corner band, but without this the
+// whole interior runs the fragment shader only to multiply to zero -- for
+// box shadows over translucent windows that is the entire window area
+// through the most expensive shader in the renderer.
+static bool apply_clip_region(pixman_region32_t *clip_region,
+		const struct wlr_box *clipped_region_box,
+		const struct fx_corner_fradii *corners) {
+	if (!wlr_box_empty(clipped_region_box)) {
+		float top = fmax(corners->top_left, corners->top_right);
+		float bottom = fmax(corners->bottom_left, corners->bottom_right);
+		float left = fmax(corners->top_left, corners->bottom_left);
+		float right = fmax(corners->top_right, corners->bottom_right);
+
+		pixman_region32_t user_clip_region;
+		pixman_region32_init_rect(
+			&user_clip_region,
+			clipped_region_box->x + (left * 0.3),
+			clipped_region_box->y + (top * 0.3),
+			fmax(clipped_region_box->width - (left + right) * 0.3, 0),
+			fmax(clipped_region_box->height - (top + bottom) * 0.3, 0)
+		);
+		pixman_region32_subtract(clip_region, clip_region, &user_clip_region);
+		pixman_region32_fini(&user_clip_region);
+		return true;
+	}
+
+	return false;
+}
+
 static void fill_corner_pcr(struct fx_vk_frag_corner_pcr_data *out,
 		const struct wlr_box *box, const struct fx_corner_fradii *corners,
 		const struct clipped_fregion *clip) {
@@ -1350,6 +1383,12 @@ static void render_box_shadow(struct fx_vk_render_pass *pass,
 	// skips pipeline setup entirely.
 	pixman_region32_intersect_rect(&clip, &clip,
 		box.x, box.y, box.width, box.height);
+	// Never rasterize the cutout interior (the window body): scene occlusion
+	// only removes it for opaque windows, so without this every translucent
+	// window burns the shadow integral over its whole area (see
+	// apply_clip_region). The shader keeps handling the corner band.
+	apply_clip_region(&clip, &options->clipped_region.area,
+		&options->clipped_region.corners);
 	if (!pixman_region32_not_empty(&clip)) {
 		pixman_region32_fini(&clip);
 		return;
@@ -1749,9 +1788,18 @@ void fx_vk_render_pass_init_blur(struct wlr_render_pass *wlr_pass,
 	if (pass == NULL) {
 		return;
 	}
+	// Only allocate the (large, persistent) per-output effect images when a
+	// blur node will actually render this frame; a blur-free setup then never
+	// pays for them. Existing buffers persist across blur-free frames so the
+	// optimized-blur cache stays valid.
+	if (!has_blur) {
+		pass->effect_buffers = NULL;
+		pass->has_blur = false;
+		return;
+	}
 	pass->effect_buffers = fx_vk_effect_buffers_get(pass->renderer, output,
 		output->width, output->height);
-	pass->has_blur = has_blur && pass->effect_buffers != NULL;
+	pass->has_blur = pass->effect_buffers != NULL;
 }
 
 bool fx_vk_render_pass_has_blur(struct wlr_render_pass *wlr_pass) {
@@ -2330,10 +2378,13 @@ void fx_vk_render_pass_add_blur(struct wlr_render_pass *wlr_pass,
 			/* snapshot the live scene straight into the blur target: chain
 			 * mip 0 on the compute path (saves the intermediate hop), else
 			 * the ping-pong spare (optimized_no_blur must stay intact for
-			 * strength re-blurs) */
+			 * strength re-blurs). Condition must match use_compute in
+			 * fx_vk_render_pass_blur: the ping-pong pair is only allocated
+			 * when the chain is NOT fully usable. */
 			struct fx_vk_effect_image *live_src =
 				(pass->renderer->blur_compute_ok && bufs->blur_chain != NULL &&
-					bufs->blur_chain->mip_levels > 1)
+					bufs->blur_chain->mip_levels > 1 &&
+					bufs->blur_chain->mip_dst_ds[0] != VK_NULL_HANDLE)
 				? bufs->blur_chain : bufs->effects;
 			copy_effect_image_region(pass,
 				pass->render_buffer->two_pass.blend_image,

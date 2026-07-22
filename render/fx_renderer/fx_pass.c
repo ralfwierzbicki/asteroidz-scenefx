@@ -51,7 +51,7 @@ struct fx_render_rect_options fx_render_rect_options_default(
 }
 
 bool fx_render_pass_init_offscreen_buffers(struct wlr_render_pass *render_pass,
-		struct wlr_output *output) {
+		struct wlr_output *output, bool needs_blur) {
 	struct fx_gles_render_pass *pass = fx_get_render_pass(render_pass);
 	if (output == NULL) {
 		pass->fx_offscreen_buffers = NULL;
@@ -60,6 +60,14 @@ bool fx_render_pass_init_offscreen_buffers(struct wlr_render_pass *render_pass,
 	if (pass->fx_offscreen_buffers != NULL) {
 		wlr_log(WLR_ERROR, "Extra buffers called twice. Ignoring...");
 		return true;
+	}
+
+	// Nothing this frame will touch the offscreen buffers: skip both lookup
+	// and allocation, so a blur-free configuration never pays the ~5
+	// output-sized buffers. Previously created buffers persist on the output
+	// addon (keeping the optimized-blur cache warm across blur-free frames).
+	if (!needs_blur && pass->color_transform == NULL) {
+		return false;
 	}
 
 	// For per output framebuffers
@@ -103,16 +111,20 @@ bool fx_render_pass_init_offscreen_buffers(struct wlr_render_pass *render_pass,
 		fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, false,
 				opaque_format, &pass->fx_offscreen_buffers->color_transform_buffer, &failed);
 	}
-	fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, false,
-			opaque_format, &pass->fx_offscreen_buffers->blur_saved_pixels_buffer, &failed);
-	fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, true,
-			alpha_format, &pass->fx_offscreen_buffers->effects_buffer, &failed);
-	fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, true,
-			alpha_format, &pass->fx_offscreen_buffers->effects_buffer_swapped, &failed);
-	fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, false,
-			opaque_format, &pass->fx_offscreen_buffers->optimized_blur_buffer, &failed);
-	fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, false,
-			opaque_format, &pass->fx_offscreen_buffers->optimized_no_blur_buffer, &failed);
+	// The blur buffer set is only (re)created when a blur node will render
+	// this frame; a color-transform-only frame allocates just its own buffer.
+	if (needs_blur) {
+		fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, false,
+				opaque_format, &pass->fx_offscreen_buffers->blur_saved_pixels_buffer, &failed);
+		fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, true,
+				alpha_format, &pass->fx_offscreen_buffers->effects_buffer, &failed);
+		fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, true,
+				alpha_format, &pass->fx_offscreen_buffers->effects_buffer_swapped, &failed);
+		fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, false,
+				opaque_format, &pass->fx_offscreen_buffers->optimized_blur_buffer, &failed);
+		fx_framebuffer_get_or_create_custom(renderer, output->allocator, width, height, false,
+				opaque_format, &pass->fx_offscreen_buffers->optimized_no_blur_buffer, &failed);
+	}
 
 	if (failed) {
 		fx_offscreen_buffers_destroy(pass->fx_offscreen_buffers);
@@ -133,7 +145,9 @@ bool fx_render_pass_init_offscreen_buffers(struct wlr_render_pass *render_pass,
 
 	// Bind back to the default buffer
 	fx_framebuffer_bind(pass->buffer);
-	return true;
+	// A color-transform-only init has no blur buffers; the caller's blur
+	// damage machinery must not run against it.
+	return needs_blur;
 }
 
 ///
@@ -466,8 +480,7 @@ static void pass_resolve_color_transform(struct fx_gles_render_pass *pass) {
 
 	push_fx_debug(renderer);
 
-	struct wlr_texture *wlr_texture =
-		fx_texture_from_buffer(&renderer->wlr_renderer, src->buffer);
+	struct wlr_texture *wlr_texture = fx_framebuffer_get_texture(src);
 	if (wlr_texture == NULL) {
 		pop_fx_debug(renderer);
 		return;
@@ -509,7 +522,7 @@ static void pass_resolve_color_transform(struct fx_gles_render_pass *pass) {
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(texture->target, 0);
 
-	wlr_texture_destroy(wlr_texture);
+	fx_framebuffer_put_texture(src, wlr_texture);
 	pop_fx_debug(renderer);
 }
 
@@ -1155,9 +1168,13 @@ void fx_render_pass_add_box_shadow(struct fx_gles_render_pass *pass,
 	TRACY_BOTH_ZONES_END;
 }
 
-// Renders the blur for each damaged rect and swaps the buffer
+// Renders the blur for each damaged rect and swaps the buffer.
+// apply_effects folds the brightness/contrast/saturation/noise post effects
+// into this draw (final blur2 upsample only), replacing the former separate
+// blur_effects fullscreen pass -- mirrors the Vulkan blur2.comp fold-in.
 static void render_blur_segments(struct fx_gles_render_pass *pass,
-		struct fx_render_blur_pass_options *fx_options, struct blur_shader* shader) {
+		struct fx_render_blur_pass_options *fx_options, struct blur_shader* shader,
+		bool apply_effects) {
 	struct fx_render_texture_options *tex_options = &fx_options->tex_options;
 	struct wlr_render_texture_options *options = &tex_options->base;
 	struct fx_renderer *renderer = pass->buffer->renderer;
@@ -1173,8 +1190,8 @@ static void render_blur_segments(struct fx_gles_render_pass *pass,
 		fx_framebuffer_bind(pass->fx_offscreen_buffers->effects_buffer);
 	}
 
-	options->texture = fx_texture_from_buffer(&renderer->wlr_renderer,
-			fx_options->current_buffer->buffer);
+	struct fx_framebuffer *src_buffer = fx_options->current_buffer;
+	options->texture = fx_framebuffer_get_texture(src_buffer);
 	struct fx_texture *texture = fx_get_texture(options->texture);
 
 	/*
@@ -1210,6 +1227,15 @@ static void render_blur_segments(struct fx_gles_render_pass *pass,
 	glUniform1i(shader->tex, 0);
 	glUniform1f(shader->radius, blur_data->radius);
 
+	// blur1 has no effects uniforms (locations -1: silently ignored)
+	glUniform1f(shader->apply_effects, apply_effects ? 1.0f : 0.0f);
+	if (apply_effects) {
+		glUniform1f(shader->noise, blur_data->noise);
+		glUniform1f(shader->brightness, blur_data->brightness);
+		glUniform1f(shader->contrast, blur_data->contrast);
+		glUniform1f(shader->saturation, blur_data->saturation);
+	}
+
 	if (shader == &renderer->shaders.blur1) {
 		glUniform2f(shader->halfpixel,
 				0.5f / (options->texture->width / 2.0f),
@@ -1229,7 +1255,8 @@ static void render_blur_segments(struct fx_gles_render_pass *pass,
 	pop_fx_debug(renderer);
 	TRACY_BOTH_ZONES_END;
 
-	wlr_texture_destroy(options->texture);
+	fx_framebuffer_put_texture(src_buffer, options->texture);
+	options->texture = NULL;
 
 	// Swap buffer. We don't want to draw to the same buffer
 	if (fx_options->current_buffer != pass->fx_offscreen_buffers->effects_buffer) {
@@ -1239,71 +1266,15 @@ static void render_blur_segments(struct fx_gles_render_pass *pass,
 	}
 }
 
-static void render_blur_effects(struct fx_gles_render_pass *pass,
-		struct fx_render_blur_pass_options *fx_options) {
-	struct fx_render_texture_options *tex_options = &fx_options->tex_options;
-	struct wlr_render_texture_options *options = &tex_options->base;
-	struct fx_renderer *renderer = pass->buffer->renderer;
-	struct blur_data *blur_data = fx_options->blur_data;
-	struct fx_texture *texture = fx_get_texture(options->texture);
-
-	struct blur_effects_shader shader = renderer->shaders.blur_effects;
-
-	struct wlr_box dst_box;
-	struct wlr_fbox src_fbox;
-	wlr_render_texture_options_get_src_box(options, &src_fbox);
-	wlr_render_texture_options_get_dst_box(options, &dst_box);
-
-	src_fbox.x /= options->texture->width;
-	src_fbox.y /= options->texture->height;
-	src_fbox.width /= options->texture->width;
-	src_fbox.height /= options->texture->height;
-
-	glDisable(GL_BLEND);
-	glDisable(GL_STENCIL_TEST);
-
-	TRACY_BOTH_ZONES_START(renderer);
-	push_fx_debug(renderer);
-
-	glUseProgram(shader.program);
-
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(texture->target, texture->tex);
-
-	switch (options->filter_mode) {
-	case WLR_SCALE_FILTER_BILINEAR:
-		glTexParameteri(texture->target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(texture->target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		break;
-	case WLR_SCALE_FILTER_NEAREST:
-		abort();
-	}
-
-	glUniform1i(shader.tex, 0);
-	glUniform1f(shader.noise, blur_data->noise);
-	glUniform1f(shader.brightness, blur_data->brightness);
-	glUniform1f(shader.contrast, blur_data->contrast);
-	glUniform1f(shader.saturation, blur_data->saturation);
-
-	set_proj_matrix(shader.proj, pass->projection_matrix, &dst_box);
-	set_tex_matrix(shader.tex_proj, options->transform, &src_fbox);
-
-	render(&dst_box, options->clip, shader.pos_attrib);
-
-	glBindTexture(texture->target, 0);
-
-	pop_fx_debug(renderer);
-	TRACY_BOTH_ZONES_END;
-
-	wlr_texture_destroy(options->texture);
-}
-
 // Blurs the fx_options current_buffer content and returns the blurred framebuffer.
 // Returns NULL when the blur parameters reach 0.
 static struct fx_framebuffer *get_main_buffer_blur(struct fx_gles_render_pass *pass,
 		struct fx_render_blur_pass_options *fx_options) {
-	if (pass->fx_offscreen_buffers == NULL) {
-		wlr_log(WLR_ERROR, "FX Pass offscreen buffers not initialized. Skipping getting blur...");
+	// NULL buffers (or a color-transform-only set without the blur buffers)
+	// is a legitimate state when blur is globally disabled -- not an error
+	if (pass->fx_offscreen_buffers == NULL ||
+			pass->fx_offscreen_buffers->effects_buffer == NULL) {
+		wlr_log(WLR_DEBUG, "FX Pass blur buffers not initialized. Skipping getting blur...");
 		return NULL;
 	}
 
@@ -1378,40 +1349,26 @@ static struct fx_framebuffer *get_main_buffer_blur(struct fx_gles_render_pass *p
 	TRACY_ZONE_TEXT_f("\tSaturation: %f", fx_options->blur_data->saturation);
 	push_fx_debug(renderer);
 
+	// The post effects (brightness/contrast/saturation/noise) fold into the
+	// final upsample draw instead of a separate fullscreen pass -- with the
+	// default blur parameters that pass would otherwise run on every frame.
+	bool want_effects = blur_data_should_parameters_blur_effects(&blur_data);
+
 	// Downscale
 	for (int i = 0; i < blur_data.num_passes; ++i) {
 		wlr_region_scale(&scaled_damage, &damage, 1.0f / (1 << (i + 1)));
-		render_blur_segments(pass, fx_options, &renderer->shaders.blur1);
+		render_blur_segments(pass, fx_options, &renderer->shaders.blur1, false);
 	}
 
 	// Upscale
 	for (int i = blur_data.num_passes - 1; i >= 0; --i) {
 		// when upsampling we make the region twice as big
 		wlr_region_scale(&scaled_damage, &damage, 1.0f / (1 << i));
-		render_blur_segments(pass, fx_options, &renderer->shaders.blur2);
+		render_blur_segments(pass, fx_options, &renderer->shaders.blur2,
+			i == 0 && want_effects);
 	}
 
 	pixman_region32_fini(&scaled_damage);
-
-	// Render additional blur effects like saturation, noise, contrast, etc...
-	if (blur_data_should_parameters_blur_effects(&blur_data)
-			&& pixman_region32_not_empty(&damage)) {
-		if (fx_options->current_buffer == pass->fx_offscreen_buffers->effects_buffer) {
-			fx_framebuffer_bind(pass->fx_offscreen_buffers->effects_buffer_swapped);
-		} else {
-			fx_framebuffer_bind(pass->fx_offscreen_buffers->effects_buffer);
-		}
-		fx_options->tex_options.base.clip = &damage;
-		fx_options->tex_options.base.texture = fx_texture_from_buffer(
-				&renderer->wlr_renderer, fx_options->current_buffer->buffer);
-		render_blur_effects(pass, fx_options);
-		if (fx_options->current_buffer != pass->fx_offscreen_buffers->effects_buffer) {
-			fx_options->current_buffer = pass->fx_offscreen_buffers->effects_buffer;
-		} else {
-			fx_options->current_buffer = pass->fx_offscreen_buffers->effects_buffer_swapped;
-		}
-	}
-
 	pixman_region32_fini(&damage);
 
 	// Bind back to the default buffer
@@ -1425,8 +1382,9 @@ static struct fx_framebuffer *get_main_buffer_blur(struct fx_gles_render_pass *p
 
 void fx_render_pass_add_blur(struct fx_gles_render_pass *pass,
 		struct fx_render_blur_pass_options *fx_options) {
-	if (pass->fx_offscreen_buffers == NULL) {
-		wlr_log(WLR_ERROR, "FX Pass offscreen buffers not initialized. Skipping blur...");
+	if (pass->fx_offscreen_buffers == NULL ||
+			pass->fx_offscreen_buffers->effects_buffer == NULL) {
+		wlr_log(WLR_DEBUG, "FX Pass blur buffers not initialized. Skipping blur...");
 		return;
 	}
 
@@ -1456,8 +1414,7 @@ void fx_render_pass_add_blur(struct fx_gles_render_pass *pass,
 	if (!buffer) {
 		goto finish;
 	}
-	struct wlr_texture *wlr_texture =
-		fx_texture_from_buffer(&renderer->wlr_renderer, buffer->buffer);
+	struct wlr_texture *wlr_texture = fx_framebuffer_get_texture(buffer);
 	struct fx_texture *blur_texture = fx_get_texture(wlr_texture);
 
 	// Get a stencil of the window ignoring transparent regions
@@ -1498,7 +1455,7 @@ void fx_render_pass_add_blur(struct fx_gles_render_pass *pass,
 		fx_render_pass_add_texture(pass, tex_options);
 	}
 
-	wlr_texture_destroy(&blur_texture->wlr_texture);
+	fx_framebuffer_put_texture(buffer, &blur_texture->wlr_texture);
 
 	// Finish stenciling
 	if (fx_options->ignore_transparent && fx_options->tex_options.base.texture) {
@@ -1512,8 +1469,9 @@ finish:
 
 bool fx_render_pass_add_optimized_blur(struct fx_gles_render_pass *pass,
 		struct fx_render_blur_pass_options *fx_options) {
-	if (pass->fx_offscreen_buffers == NULL) {
-		wlr_log(WLR_ERROR, "FX Pass offscreen buffers not initialized. Skipping optimized blur...");
+	if (pass->fx_offscreen_buffers == NULL ||
+			pass->fx_offscreen_buffers->effects_buffer == NULL) {
+		wlr_log(WLR_DEBUG, "FX Pass blur buffers not initialized. Skipping optimized blur...");
 		return false;
 	}
 	struct fx_renderer *renderer = pass->buffer->renderer;
@@ -1585,8 +1543,7 @@ void fx_render_pass_read_to_buffer(struct fx_gles_render_pass *pass,
 	pixman_region32_init(&region);
 	pixman_region32_copy(&region, _region);
 
-	struct wlr_texture *src_tex =
-		fx_texture_from_buffer(&pass->buffer->renderer->wlr_renderer, src_buffer->buffer);
+	struct wlr_texture *src_tex = fx_framebuffer_get_texture(src_buffer);
 	if (src_tex == NULL) {
 		goto done;
 	}
@@ -1611,7 +1568,7 @@ void fx_render_pass_read_to_buffer(struct fx_gles_render_pass *pass,
 			.height = src_buffer->buffer->height,
 		},
 	});
-	wlr_texture_destroy(src_tex);
+	fx_framebuffer_put_texture(src_buffer, src_tex);
 
 	// Bind back to the main WLR buffer
 	fx_framebuffer_bind(pass->buffer);

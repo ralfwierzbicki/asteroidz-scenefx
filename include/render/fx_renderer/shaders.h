@@ -207,23 +207,16 @@ struct blur_shader {
 	GLint pos_attrib;
 	GLint radius;
 	GLint halfpixel;
+	// blur2 only (-1 on blur1): final-iteration post-effects fold-in,
+	// replacing the former separate blur_effects fullscreen pass
+	GLint apply_effects;
+	GLint noise;
+	GLint brightness;
+	GLint contrast;
+	GLint saturation;
 };
 
 bool link_blur1_program(struct blur_shader *shader);
 bool link_blur2_program(struct blur_shader *shader);
-
-struct blur_effects_shader {
-	GLuint program;
-	GLint proj;
-	GLint tex_proj;
-	GLint tex;
-	GLint pos_attrib;
-	GLfloat noise;
-	GLfloat brightness;
-	GLfloat contrast;
-	GLfloat saturation;
-};
-
-bool link_blur_effects_program(struct blur_effects_shader *shader);
 
 #endif

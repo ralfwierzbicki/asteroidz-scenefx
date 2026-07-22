@@ -1293,7 +1293,6 @@ void fx_vk_effect_buffers_destroy(struct fx_vk_effect_buffers *bufs) {
 	fx_vk_effect_image_destroy(bufs->effects_swapped);
 	fx_vk_effect_image_destroy(bufs->optimized_blur);
 	fx_vk_effect_image_destroy(bufs->optimized_no_blur);
-	fx_vk_effect_image_destroy(bufs->blur_saved_pixels);
 	fx_vk_effect_image_destroy(bufs->blur_chain);
 	wl_list_remove(&bufs->link);
 	wlr_addon_finish(&bufs->addon);
@@ -1321,24 +1320,36 @@ struct fx_vk_effect_buffers *fx_vk_effect_buffers_get(
 	bufs->renderer = renderer;
 	bufs->width = width;
 	bufs->height = height;
-	bufs->effects = fx_vk_effect_image_create(renderer, width, height, 1);
-	bufs->effects_swapped = fx_vk_effect_image_create(renderer, width, height, 1);
 	bufs->optimized_blur = fx_vk_effect_image_create(renderer, width, height, 1);
 	bufs->optimized_no_blur = fx_vk_effect_image_create(renderer, width, height, 1);
-	bufs->blur_saved_pixels = fx_vk_effect_image_create(renderer, width, height, 1);
 	if (renderer->blur_compute_ok) {
 		// Mipped chain for the compute blur; on failure blur_chain stays
 		// NULL and the blur falls back to the graphics ping-pong.
 		bufs->blur_chain = fx_vk_effect_image_create(renderer, width, height,
 			FX_VK_BLUR_CHAIN_MAX_MIPS);
 	}
-	if (!bufs->effects || !bufs->effects_swapped || !bufs->optimized_blur
-			|| !bufs->optimized_no_blur || !bufs->blur_saved_pixels) {
+	// The graphics ping-pong pair is only sampled when the compute chain
+	// can't run (fx_vk_render_pass_blur's use_compute check); skip the two
+	// full-size 16F allocations when the chain is fully usable.
+	bool compute_chain_ok = bufs->blur_chain != NULL &&
+		bufs->blur_chain->mip_levels > 1 &&
+		bufs->blur_chain->mip_dst_ds[0] != VK_NULL_HANDLE;
+	if (bufs->blur_chain != NULL && !compute_chain_ok) {
+		// Chain image exists but its compute descriptors failed: it can never
+		// be dispatched, so don't keep the mipped image around.
+		fx_vk_effect_image_destroy(bufs->blur_chain);
+		bufs->blur_chain = NULL;
+	}
+	if (!compute_chain_ok) {
+		bufs->effects = fx_vk_effect_image_create(renderer, width, height, 1);
+		bufs->effects_swapped = fx_vk_effect_image_create(renderer, width, height, 1);
+	}
+	if (!bufs->optimized_blur || !bufs->optimized_no_blur ||
+			(!compute_chain_ok && (!bufs->effects || !bufs->effects_swapped))) {
 		fx_vk_effect_image_destroy(bufs->effects);
 		fx_vk_effect_image_destroy(bufs->effects_swapped);
 		fx_vk_effect_image_destroy(bufs->optimized_blur);
 		fx_vk_effect_image_destroy(bufs->optimized_no_blur);
-		fx_vk_effect_image_destroy(bufs->blur_saved_pixels);
 		fx_vk_effect_image_destroy(bufs->blur_chain);
 		free(bufs);
 		return NULL;
