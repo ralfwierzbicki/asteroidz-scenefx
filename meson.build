@@ -1,7 +1,7 @@
 project(
 	'asteroidz-scenefx',
 	'c',
-	version: '0.17.4',
+	version: '0.17.5',
 	license: 'MIT',
 	meson_version: '>=1.3',
 	default_options: [
